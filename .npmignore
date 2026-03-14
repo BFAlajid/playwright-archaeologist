@@ -1,0 +1,27 @@
+# Source and tests (dist/ is published via "files" in package.json)
+test/
+docs/
+.github/
+coverage/
+.archaeologist/
+bench-results.json
+
+# Config files not needed by consumers
+tsconfig.json
+tsup.config.ts
+vitest.config.ts
+.eslintrc*
+.prettierrc*
+.editorconfig
+
+# Markdown (keep README)
+CHANGELOG.md
+CONTRIBUTING.md
+ARCHITECTURE.md
+DESIGN.md
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

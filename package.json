@@ -1,0 +1,83 @@
+{
+  "name": "playwright-archaeologist",
+  "version": "0.1.0",
+  "description": "Crawl any running web app and generate a complete behavioral specification — sitemap, forms, APIs, screenshots, and regression baselines",
+  "author": "playwright-archaeologist contributors",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/BFAlajid/playwright-archaeologist.git"
+  },
+  "bugs": {
+    "url": "https://github.com/BFAlajid/playwright-archaeologist/issues"
+  },
+  "homepage": "https://github.com/BFAlajid/playwright-archaeologist#readme",
+  "keywords": [
+    "playwright",
+    "crawler",
+    "web-crawler",
+    "sitemap",
+    "screenshots",
+    "openapi",
+    "api-discovery",
+    "behavioral-testing",
+    "regression-testing",
+    "spa",
+    "forms",
+    "flow-graph",
+    "web-scraping",
+    "qa",
+    "testing",
+    "audit"
+  ],
+  "bin": {
+    "playwright-archaeologist": "./bin/cli.js",
+    "pa": "./bin/cli.js"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "files": [
+    "dist",
+    "bin",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:unit": "vitest run test/unit",
+    "test:integration": "vitest run test/integration",
+    "bench": "vitest bench test/performance/",
+    "bench:ci": "vitest bench test/performance/ --reporter=json --outputFile=bench-results.json",
+    "lint": "eslint src/",
+    "prepublishOnly": "npm run build"
+  },
+  "dependencies": {
+    "playwright": "^1.49.0",
+    "commander": "^13.0.0",
+    "zod": "^3.24.0",
+    "ora": "^8.0.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0",
+    "tsup": "^8.3.0",
+    "vitest": "^3.0.0",
+    "@types/node": "^22.0.0",
+    "express": "^4.21.0",
+    "@types/express": "^4.17.0",
+    "ws": "^8.18.0",
+    "@types/ws": "^8.5.0"
+  }
+}

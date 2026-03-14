@@ -1,0 +1,56 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Crawl output
+.archaeologist/
+
+# Test & coverage
+coverage/
+
+# Benchmark results
+bench-results.json
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor config
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Environment
+.env
+.env.*
+
+# Logs
+*.log
+npm-debug.log*
+
+# Research & planning docs (kept locally, not pushed)
+ARCHITECTURE.md
+ARCHITECTURE-REVIEW.md
+CODE-REVIEW.md
+COMPETITIVE-ANALYSIS.md
+CRAWLEE-EVALUATION.md
+DIFF-RESEARCH.md
+FINAL-GAP-ANALYSIS.md
+HTML-REPORT-RESEARCH.md
+IMPLEMENTATION-PLAN.md
+PLAYWRIGHT-API-REFERENCE.md
+SPA-CRAWLING-RESEARCH.md
+THREAT-MODEL.md
+test/performance/PERFORMANCE-ANALYSIS.md
+
+# Crawl test outputs
+baseline/
+current/
+full-crawl/
+full-site/
+full-site-2/
+diff-output/
+diff-result/
