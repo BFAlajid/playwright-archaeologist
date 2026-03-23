@@ -161,7 +161,7 @@ describe('createNetworkLogger', () => {
 
     expect(result.responses).toHaveLength(1);
     expect(result.responses[0].statusCode).toBe(200);
-    expect(result.responses[0].body).toBe('{"users": []}');
+    expect(result.responses[0].body).toBe('{"users":[]}');
   });
 
   // -----------------------------------------------------------------------

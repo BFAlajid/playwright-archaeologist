@@ -28,6 +28,7 @@ import { join } from 'node:path';
 const DEFAULT_VIEWPORT: Viewport = { width: 1280, height: 720 };
 const MAX_SCROLL_INCREMENTS = 3;
 const SCROLL_SETTLE_MS = 200;
+const MAX_FULLPAGE_HEIGHT = 10_000;
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -68,8 +69,17 @@ export async function captureScreenshots(
     // Detect modals/dialogs before taking screenshots
     const modalDetected = await detectModals(page);
 
-    // Take full-page screenshot
-    const fullPageBuffer = await page.screenshot({ fullPage: true, path: fullPagePath });
+    // Check scroll height and cap if too tall to prevent OOM
+    const scrollHeight = await page.evaluate(() => document.documentElement.scrollHeight);
+    const useCappedScreenshot = scrollHeight > MAX_FULLPAGE_HEIGHT;
+
+    // Take full-page screenshot (capped if page is very tall)
+    const fullPageBuffer = useCappedScreenshot
+      ? await page.screenshot({
+          clip: { x: 0, y: 0, width: effectiveViewport.width, height: MAX_FULLPAGE_HEIGHT },
+          path: fullPagePath,
+        })
+      : await page.screenshot({ fullPage: true, path: fullPagePath });
 
     // Take viewport-only screenshot
     const viewportBuffer = await page.screenshot({ path: viewportPath });

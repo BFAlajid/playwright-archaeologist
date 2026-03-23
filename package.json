@@ -1,6 +1,6 @@
 {
   "name": "playwright-archaeologist",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Crawl any running web app and generate a complete behavioral specification — sitemap, forms, APIs, screenshots, and regression baselines",
   "author": "playwright-archaeologist contributors",
   "license": "MIT",
@@ -61,8 +61,8 @@
     "test:integration": "vitest run test/integration",
     "bench": "vitest bench test/performance/",
     "bench:ci": "vitest bench test/performance/ --reporter=json --outputFile=bench-results.json",
-    "lint": "eslint src/",
-    "prepublishOnly": "npm run build"
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "npm run typecheck && npm run test:unit && npm run build"
   },
   "dependencies": {
     "playwright": "^1.49.0",

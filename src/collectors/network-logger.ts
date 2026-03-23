@@ -24,7 +24,7 @@ import type {
   WebSocketConnection,
   RequestClassification,
 } from '../types/artifacts.js';
-import { scrubHeaders } from '../security/credential-scrubber.js';
+import { scrubHeaders, scrubBody } from '../security/credential-scrubber.js';
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -279,7 +279,7 @@ export function createNetworkLogger(
     };
 
     if (postData !== undefined) {
-      captured.body = postData;
+      captured.body = scrubBody(postData);
     }
     if (contentType !== undefined) {
       captured.contentType = contentType;
@@ -329,7 +329,7 @@ export function createNetworkLogger(
     };
 
     if (body !== undefined) {
-      captured.body = body;
+      captured.body = scrubBody(body);
     }
     if (contentType !== undefined) {
       captured.contentType = contentType;
@@ -392,9 +392,10 @@ export function createNetworkLogger(
       connection.messageCount++;
       if (receivedCount < MAX_WS_MESSAGES_PER_DIRECTION) {
         receivedCount++;
+        const rawData = typeof data.payload === 'string' ? data.payload : data.payload.toString('utf-8');
         connection.sampleMessages.push({
           direction: 'received',
-          data: typeof data.payload === 'string' ? data.payload : data.payload.toString('utf-8'),
+          data: scrubBody(rawData),
           timestamp: new Date().toISOString(),
         });
       }
@@ -404,9 +405,10 @@ export function createNetworkLogger(
       connection.messageCount++;
       if (sentCount < MAX_WS_MESSAGES_PER_DIRECTION) {
         sentCount++;
+        const rawData = typeof data.payload === 'string' ? data.payload : data.payload.toString('utf-8');
         connection.sampleMessages.push({
           direction: 'sent',
-          data: typeof data.payload === 'string' ? data.payload : data.payload.toString('utf-8'),
+          data: scrubBody(rawData),
           timestamp: new Date().toISOString(),
         });
       }

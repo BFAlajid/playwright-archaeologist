@@ -104,13 +104,13 @@ pa dig https://myapp.com --resume
 
 ```bash
 # Compare crawl bundles (exit code 0 = identical, 1 = changes)
-pa diff .archaeologist/bundle-old.zip .archaeologist/bundle-new.zip
+pa diff ./baseline/bundle ./current/bundle
 
 # Generate an HTML diff report
-pa diff old.zip new.zip --format-html diff-report.html
+pa diff ./old-bundle ./new-bundle --format-html diff-report.html
 
 # Generate a JSON diff report
-pa diff old.zip new.zip --format-json diff-report.json
+pa diff ./old-bundle ./new-bundle --format-json diff-report.json
 ```
 
 ### Authenticated crawling
@@ -144,13 +144,33 @@ pa dig https://myapp.com --cookies ./cookies.json
 | `--resume` | `false` | Resume from the last checkpoint |
 | `--include <pattern>` | — | URL patterns to include (repeatable) |
 | `--exclude <pattern>` | — | URL patterns to exclude (repeatable) |
+| `--follow-external` | `false` | Follow links to external origins |
+| `--include-iframes` | `false` | Crawl cross-origin iframes |
+| `--delay <ms>` | `0` | Delay between page visits (0-60000ms) |
+| `--timeout <ms>` | `30000` | Per-page navigation timeout (1000-300000ms) |
+| `--max-time <s>` | `3600` | Global crawl timeout in seconds (0=no limit, max 86400) |
+| `--include-cookies` | `false` | Include cookies and auth data in output |
+| `-f, --format <fmt>` | `both` | Output format: `html`, `json`, `openapi`, `both` |
+| `--no-har` | `false` | Skip HAR recording |
+| `--allow-private` | `false` | Bypass SSRF protection (allow private IPs) |
+| `-y, --yes` | `false` | Skip confirmation prompts |
+| `-v, --verbose` | `false` | Enable debug logging |
 
 ### `pa diff` options
 
-| Option | Description |
-|---|---|
-| `--format-html <path>` | Write an HTML diff report |
-| `--format-json <path>` | Write a JSON diff report |
+| Option | Default | Description |
+|---|---|---|
+| `--format-html <path>` | — | Write an HTML diff report |
+| `--format-json <path>` | — | Write a JSON diff report |
+| `--format-junit <path>` | — | Write a JUnit XML report |
+| `--format-markdown <path>` | — | Write a Markdown report |
+| `-o, --output <dir>` | — | Output directory for diff artifacts |
+| `--threshold <n>` | `0.1` | Pixel diff threshold (0-1) |
+| `--max-ratio <n>` | `0.5` | Max allowed diff ratio (0-100) |
+| `--ignore-fields <fields>` | `timestamp,createdAt,...` | Comma-separated fields to ignore in comparisons |
+| `--normalize-dynamic` | `false` | Normalize UUIDs/timestamps before diff |
+| `--detailed` | `false` | Show value-level diffs (not just schema-level) |
+| `-v, --verbose` | `false` | Enable debug logging |
 
 ---
 
@@ -163,14 +183,17 @@ After a crawl, the `.archaeologist/` directory contains:
   report.html            # Browsable HTML report with all findings
   sitemap.json           # Discovered pages with metadata
   forms.json             # Form catalog with field details
-  api.json               # Observed API endpoints
-  openapi.yaml           # Generated OpenAPI 3.0 specification
-  flow-graph.svg         # Navigation flow diagram (Mermaid)
+  api-map.json           # Observed API endpoints
+  openapi.json           # Generated OpenAPI 3.0 specification
+  flow-graph.mmd         # Navigation flow diagram (Mermaid text)
   screenshots/           # Full-page and viewport screenshots
-    index.png
-    about.png
+    index_full.png
+    index_viewport.png
     ...
-  bundle.zip             # Snapshot bundle for regression diffing
+  bundle/                # Snapshot bundle for regression diffing
+    manifest.json
+    data/
+    screenshots/
   checkpoint.json        # Resume checkpoint (deleted on completion)
 ```
 
@@ -181,39 +204,44 @@ After a crawl, the `.archaeologist/` directory contains:
 Use `playwright-archaeologist` as a library in your own tools:
 
 ```typescript
-import { dig } from 'playwright-archaeologist';
+import { dig, CrawlConfigSchema } from 'playwright-archaeologist';
 
-const result = await dig({
-  entryUrl: 'https://myapp.com',
+// Validate and resolve config via Zod schema
+const config = CrawlConfigSchema.parse({
+  targetUrl: 'https://myapp.com',
   depth: 3,
   maxPages: 50,
   concurrency: 2,
-  output: './my-output',
-  screenshots: true,
+  outputDir: './my-output',
+  noScreenshots: false,
   viewport: { width: 1280, height: 720 },
 });
 
-console.log(`Crawled ${result.pages.length} pages`);
-console.log(`Found ${result.forms.length} forms`);
-console.log(`Discovered ${result.apis.length} API endpoints`);
+const result = await dig(config);
+
+console.log(`Crawled ${result.artifacts.meta.pagesVisited} pages`);
+console.log(`Found ${result.artifacts.forms.length} forms`);
+console.log(`Discovered ${result.artifacts.apiEndpoints.length} API endpoints`);
 ```
 
 ### Comparing snapshots programmatically
 
 ```typescript
 import { diffBundles, generateDiffReportHtml } from 'playwright-archaeologist';
+import { writeFile } from 'node:fs/promises';
 
-const diff = await diffBundles('./old-bundle.zip', './new-bundle.zip');
+const diff = await diffBundles('./old-bundle', './new-bundle');
 
 if (diff.hasChanges) {
+  const s = diff.summary;
   console.log('Changes detected:');
-  console.log(`  Pages added: ${diff.pages.added.length}`);
-  console.log(`  Pages removed: ${diff.pages.removed.length}`);
-  console.log(`  APIs changed: ${diff.apis.modified.length}`);
+  console.log(`  Routes added: ${s.routes.added}`);
+  console.log(`  Routes removed: ${s.routes.removed}`);
+  console.log(`  APIs changed: ${s.api.changed}`);
 
   // Generate HTML report
   const html = generateDiffReportHtml(diff);
-  await fs.writeFile('diff-report.html', html);
+  await writeFile('diff-report.html', html);
 }
 ```
 
@@ -331,7 +359,7 @@ jobs:
 
       - name: Diff
         run: |
-          npx pa diff ./baseline/bundle.zip ./current/bundle.zip \
+          npx pa diff ./baseline/bundle ./current/bundle \
             --format-html regression-report.html
 
       - name: Upload report
@@ -350,7 +378,7 @@ Contributions are welcome. Please open an issue first to discuss what you would 
 
 ```bash
 # Clone and install
-git clone https://github.com/AshGw/playwright-archaeologist.git
+git clone https://github.com/BFAlajid/playwright-archaeologist.git
 cd playwright-archaeologist
 npm install
 
@@ -379,11 +407,45 @@ src/
   auth/               # Auth script handler
   report/             # HTML report generator
   diff/               # Snapshot diff engine and reports
-  bundle/             # ZIP bundle creator
+  bundle/             # Directory-based bundle creator
   security/           # SSRF guard, credential scrubber, output sanitizer
   types/              # TypeScript interfaces, Zod schemas, error hierarchy
   utils/              # Logger, URL utilities, progress tracker
 ```
+
+---
+
+## Troubleshooting
+
+| Problem | Solution |
+|---|---|
+| `Chromium browser not found` | Run `pa install` to download Chromium |
+| `SSRF: blocked private IP` on localhost | Use `--allow-private` to bypass SSRF protection for local development |
+| Auth script rejected | Check for forbidden imports (`fs`, `child_process`, `net`). Confirm the prompt if the script is trusted. |
+| Permission denied on output dir | Ensure the output directory is writable. Use `-o` to specify a different path. |
+| Page navigation timeout | Increase with `--timeout 60000` (ms). Default is 30s. |
+| Crawl taking too long | Reduce scope with `--max-pages` or `--depth`. Use `--no-screenshots` for faster crawls. |
+| Resume not working | Ensure `checkpoint.json` exists in the output dir. Use the same `--output` path. |
+
+---
+
+## Error Codes
+
+| Code | Error | When | Recovery |
+|---|---|---|---|
+| `ERR_CONFIG` | ConfigError | Invalid CLI options or config values | Check option syntax, run `pa dig --help` |
+| `ERR_AUTH` | AuthError | Auth script not found, import failed, or execution error | Verify script path and exports |
+| `ERR_NAVIGATION` | NavigationError | Page timeout, network error, HTTP error | Automatic skip; crawl continues |
+| `ERR_COLLECTOR` | CollectorError | Scanner/prober/logger/capturer failure | Partial data collected; crawl continues |
+| `ERR_BROWSER_CONTEXT` | BrowserContextError | Browser context crash | Context recycled; page re-enqueued |
+| `ERR_FRONTIER` | FrontierError | Queue or checkpoint I/O failure | Crawl continues without checkpointing |
+| `ERR_SECURITY_BLOCK` | SecurityBlockError | SSRF or protocol violation | URL skipped; crawl continues |
+| `ERR_ASSEMBLER` | AssemblerError | Data merge/dedup failure | Crawl aborts; partial output may exist |
+| `ERR_REPORT` | ReportError | Report generation failure | Section skipped; other outputs still written |
+| `ERR_DIFF` | DiffError | Bundle not found or corrupt manifest | Check bundle paths; re-run crawl |
+| `ERR_BUNDLE` | BundleError | Bundle I/O or integrity failure | Check disk space and permissions |
+
+Exit codes: `0` = success (or identical diff), `1` = changes detected (diff), `2` = error.
 
 ---
 

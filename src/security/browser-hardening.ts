@@ -17,7 +17,10 @@ export interface SecureContextOptions {
   acceptDownloads?: boolean;
 }
 
-export const TOOL_VERSION = '0.1.0';
+import { createRequire } from 'node:module';
+const _require = createRequire(import.meta.url);
+const _pkg = _require('../../package.json') as { version: string };
+export const TOOL_VERSION = _pkg.version;
 
 /**
  * Maximum number of HTTP redirects to follow before aborting.

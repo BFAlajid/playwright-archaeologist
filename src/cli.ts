@@ -177,7 +177,7 @@ program
           accessSync(cookiesFile, constants.R_OK);
         } catch {
           throw new AuthError(
-            'cookie_file_not_found' as 'cookie_file_malformed',
+            'cookie_file_not_found',
             `Cookies file not found: ${cookiesFile}`,
             cookiesFile,
           );

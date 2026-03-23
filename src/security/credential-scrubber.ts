@@ -349,48 +349,7 @@ export function scrubBody(body: string): string {
 /**
  * Alias for scrubBody — used by security tests as scrubResponseBody.
  */
-export function scrubResponseBody(body: string): string {
-  if (!body) return body;
-
-  let result = body;
-
-  // Try JSON parse
-  try {
-    const parsed = JSON.parse(body);
-    if (typeof parsed === 'object' && parsed !== null) {
-      const scrubbed = scrubJsonObject(parsed);
-      result = JSON.stringify(scrubbed);
-      result = scrubCreditCards(result);
-      result = scrubAwsKeys(result);
-      return result;
-    }
-  } catch {
-    // Not valid JSON
-  }
-
-  // Try form-encoded (detect by presence of & and = without spaces before first &)
-  if (body.includes('=') && /^[^{<]/.test(body)) {
-    const maybeForm = scrubFormBody(body);
-    if (maybeForm !== body) {
-      result = maybeForm;
-      result = scrubCreditCards(result);
-      result = scrubAwsKeys(result);
-      return result;
-    }
-  }
-
-  // Plain text — apply pattern-based scrubbing
-  result = scrubCreditCards(result);
-  result = scrubAwsKeys(result);
-
-  // Best-effort regex scrub for sensitive field patterns in malformed/partial JSON
-  result = result.replace(
-    /("(?:password|passwd|secret|client_secret|token|access_token|refresh_token|apiKey|api_key|aws_access_key|aws_secret_key|SessionToken)")\s*:\s*"([^"]*?)"/gi,
-    '$1:"[REDACTED]"'
-  );
-
-  return result;
-}
+export const scrubResponseBody = scrubBody;
 
 /**
  * Scrub known environment variable values from text.

@@ -160,6 +160,7 @@ function generateCss(): string {
       transition: opacity 0.15s;
     }
     .nav a:hover, .nav a:focus { opacity: 1; }
+    .nav a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 
     /* Main */
     .container {
@@ -181,6 +182,8 @@ function generateCss(): string {
       border-radius: var(--radius);
       padding: 1rem 1.25rem;
     }
+    .stat-card.has-errors { border-color: #e74c3c; }
+    .stat-card.has-errors .stat-value { color: #e74c3c; }
     .stat-label {
       font-size: 0.75rem;
       text-transform: uppercase;
@@ -265,7 +268,8 @@ function generateCss(): string {
       letter-spacing: 0.03em;
       color: var(--text-muted);
       position: sticky;
-      top: 0;
+      top: 48px;
+      z-index: 10;
     }
     tbody tr:hover { background: var(--bg-surface-hover); }
     tr[data-searchable] { transition: none; }
@@ -467,23 +471,39 @@ function generateJs(hasScreenshots: boolean): string {
       var dialog = document.getElementById('screenshot-dialog');
       var dialogImg = document.getElementById('dialog-img');
       var dialogLink = document.getElementById('dialog-link');
+      var closeBtn = document.getElementById('dialog-close');
       var cards = document.querySelectorAll('.screenshot-card');
+      var lastFocusedCard = null;
+
+      function openLightbox(card) {
+        var src = card.getAttribute('data-full');
+        if (dialogImg) dialogImg.src = src;
+        if (dialogLink) dialogLink.href = src;
+        lastFocusedCard = card;
+        if (dialog && dialog.showModal) {
+          dialog.showModal();
+          if (closeBtn) closeBtn.focus();
+        }
+      }
+
+      function closeLightbox() {
+        if (dialog) dialog.close();
+        if (lastFocusedCard) lastFocusedCard.focus();
+        lastFocusedCard = null;
+      }
+
       for (var k = 0; k < cards.length; k++) {
-        cards[k].addEventListener('click', function() {
-          var src = this.getAttribute('data-full');
-          var thumb = this.querySelector('img');
-          if (dialogImg && thumb) dialogImg.src = thumb.src;
-          if (dialogLink) dialogLink.href = src;
-          if (dialog && dialog.showModal) dialog.showModal();
+        cards[k].addEventListener('click', function() { openLightbox(this); });
+        cards[k].addEventListener('keydown', function(e) {
+          if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openLightbox(this); }
         });
       }
-      var closeBtn = document.getElementById('dialog-close');
-      if (closeBtn && dialog) {
-        closeBtn.addEventListener('click', function() { dialog.close(); });
+      if (closeBtn) {
+        closeBtn.addEventListener('click', function() { closeLightbox(); });
       }
       if (dialog) {
         dialog.addEventListener('click', function(e) {
-          if (e.target === dialog) dialog.close();
+          if (e.target === dialog) closeLightbox();
         });
       }
       ` : ''}
@@ -636,7 +656,7 @@ function renderStatsBar(input: ReportInput): string {
       <div class="stat-label">Pages Visited</div>
       <div class="stat-value">${input.pagesVisited}</div>
     </div>
-    <div class="stat-card">
+    <div class="stat-card${input.errors > 0 ? ' has-errors' : ''}">
       <div class="stat-label">Errors</div>
       <div class="stat-value">${input.errors}</div>
     </div>
@@ -737,7 +757,7 @@ function renderScreenshotsSection(screenshots: ReportScreenshot[]): string {
       label = ss.url;
     }
 
-    return `<div class="screenshot-card" data-full="${escapeAttribute(ss.fullPath)}" data-searchable>
+    return `<div class="screenshot-card" data-full="${escapeAttribute(ss.fullPath)}" data-searchable tabindex="0" role="button" aria-label="View screenshot of ${escapeAttribute(label)}">
       <img src="data:image/jpeg;base64,${escapeAttribute(ss.thumbnailBase64)}" alt="Screenshot of ${escapeAttribute(label)}" loading="lazy">
       <div class="screenshot-label">${escapeHtml(label)}</div>
     </div>`;
@@ -755,7 +775,7 @@ function renderScreenshotsSection(screenshots: ReportScreenshot[]): string {
       <img id="dialog-img" src="" alt="Full screenshot">
       <div class="dialog-actions">
         <a id="dialog-link" href="" target="_blank" rel="noopener">Open Full Image</a>
-        <button id="dialog-close" type="button">Close</button>
+        <button id="dialog-close" type="button" aria-label="Close">Close</button>
       </div>
     </div>
   </dialog>`;

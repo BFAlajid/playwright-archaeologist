@@ -60,6 +60,26 @@ const STYLES = `
   ul.change-list { list-style: none; padding: 0; }
   ul.change-list li { padding: 0.5rem 0; border-bottom: 1px solid #f0f0f0; }
   ul.change-list li:last-child { border-bottom: none; }
+
+  @media (prefers-color-scheme: dark) {
+    body { color: #c9d1d9; background: #0d1117; }
+    h2 { border-bottom-color: #30363d; }
+    .meta { color: #8b949e; }
+    .summary-card { background: #161b22; box-shadow: 0 1px 3px rgba(0,0,0,0.3); }
+    .no-changes { background: #1b3a2d; color: #7ee787; }
+    .badge-added { background: #1b3a2d; color: #7ee787; }
+    .badge-removed { background: #3d1f28; color: #f85149; }
+    .badge-changed { background: #3d2e00; color: #d29922; }
+    .badge-unchanged { background: #21262d; color: #8b949e; }
+    table { background: #161b22; box-shadow: 0 1px 3px rgba(0,0,0,0.3); }
+    th, td { border-bottom-color: #30363d; }
+    th { background: #21262d; color: #8b949e; }
+    .change-detail { color: #8b949e; }
+    .old-value { color: #f85149; }
+    .new-value { color: #7ee787; }
+    .empty-section { color: #8b949e; }
+    ul.change-list li { border-bottom-color: #21262d; }
+  }
 `;
 
 // ---------------------------------------------------------------------------

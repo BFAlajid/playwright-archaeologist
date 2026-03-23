@@ -8,5 +8,5 @@ export default defineConfig({
   clean: true,
   splitting: true,
   sourcemap: true,
-  external: ['playwright'],
+  external: ['playwright', 'commander', 'zod', 'ora'],
 });

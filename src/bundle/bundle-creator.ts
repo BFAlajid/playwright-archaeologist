@@ -20,10 +20,13 @@ import {
   mkdir,
   copyFile,
   writeFile,
+  rename,
+  rm,
 } from 'node:fs/promises';
 import { join, basename, extname, relative } from 'node:path';
 import type { BundleManifest, BundleFileEntry } from '../types/artifacts.js';
 import { BundleError } from '../types/errors.js';
+import { TOOL_VERSION } from '../security/browser-hardening.js';
 
 /** File extensions mapped to bundle file types. */
 function classifyFile(filePath: string): BundleFileEntry['type'] | null {
@@ -210,9 +213,13 @@ export async function createBundle(
     );
   }
 
-  // Create bundle directory structure
-  await mkdir(join(bundlePath, 'screenshots'), { recursive: true });
-  await mkdir(join(bundlePath, 'data'), { recursive: true });
+  // Atomic bundle creation: write to temp dir, then rename
+  const tmpBundlePath = bundlePath + '.tmp';
+  await rm(tmpBundlePath, { recursive: true, force: true });
+
+  // Create bundle directory structure in temp location
+  await mkdir(join(tmpBundlePath, 'screenshots'), { recursive: true });
+  await mkdir(join(tmpBundlePath, 'data'), { recursive: true });
 
   // Collect all files from output directory
   const allFiles = await collectFiles(outputDir);
@@ -226,7 +233,7 @@ export async function createBundle(
     const fileName = basename(filePath);
     const subdir = targetSubdir(filePath);
     const bundleRelPath = subdir ? join(subdir, fileName) : fileName;
-    const destPath = join(bundlePath, bundleRelPath);
+    const destPath = join(tmpBundlePath, bundleRelPath);
 
     // Copy file to bundle
     await copyFile(filePath, destPath);
@@ -258,16 +265,20 @@ export async function createBundle(
   const manifest: BundleManifest = {
     version: 1,
     tool: 'playwright-archaeologist',
-    toolVersion: '0.1.0', // TODO: read from package.json at build time
+    toolVersion: TOOL_VERSION,
     createdAt: new Date().toISOString(),
     config,
     stats,
     files: fileEntries,
   };
 
-  // Write manifest to bundle
-  const manifestPath = join(bundlePath, 'manifest.json');
+  // Write manifest to temp bundle
+  const manifestPath = join(tmpBundlePath, 'manifest.json');
   await writeFile(manifestPath, JSON.stringify(manifest, null, 2), 'utf-8');
+
+  // Atomic rename: move completed bundle to final path
+  await rm(bundlePath, { recursive: true, force: true });
+  await rename(tmpBundlePath, bundlePath);
 
   return manifest;
 }
