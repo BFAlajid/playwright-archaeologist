@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Performance bench files (`test/performance/*.bench.ts`) now exercise the real shipped modules from `src/` instead of inlined fake reimplementations:
+  - `crawl-simulation.bench.ts` calls `Frontier`, `normalizeUrl`, `buildRouteTree`, and `buildAssembledArtifacts`.
+  - `diff.bench.ts` calls `diffBundles` (over tmp bundle directories written synchronously per iteration) and `diffScreenshotPair` (over synthetic PNGs produced with `pngjs`).
+  - `report-generation.bench.ts` calls `generateReportHtml` and `generateDiffReportHtml`.
+- `test/performance/budget.json` metrics renamed and pruned to match the new bench names. Removed entries that no longer correspond to anything measured (`sha256Hash100Screenshots`, `pixelmatch10/100Screenshots`, `jsondiffpatch1000Endpoints`, `zipCreation100Pages`, `zipExtraction100Pages`, `base64Encode100/500Thumbnails`, `jsonSerializationTime`, `peakRssDuringGeneration`, `htmlFileSize100/500Pages`, `memoryAt100/10000/50000Urls`, `has10000UrlCheck`, `apiGrouperWith5000Requests`, `routeTreeWith500Urls`, `flowGraphWith500Nodes`, `size100/500Pages`, `rssMaxDuring500PageCrawl`). Added `report.htmlGeneration1000Pages`, `report.htmlGeneration10000Pages`, `report.diffReportGeneration`, `diff.pixelDiff100x100`, `diff.pixelDiff1000x1000`, `assembler.routeTreeWith1000Urls`, `assembler.buildAssembledArtifacts500Pages`. The matcher in `enforce-budget.test.ts` (`benchLower.includes(keyLower.slice(0, 8))`) is unchanged — bench names still contain the first 8 characters of their budget key.
+
 ## [0.2.0] - 2026-04-21
 
 ### Added

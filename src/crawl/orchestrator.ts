@@ -209,8 +209,14 @@ export async function dig(config: ResolvedConfig): Promise<DigResult> {
     // A single session-wide DNS cache is shared across every context so
     // that rebinding detection is meaningful across the whole crawl, not
     // just within one context.
+    //
+    // Per-context HAR paths are supplied via `contextOptionsFactory`:
+    // each newly-created context gets a unique `crawl.har.N.partial`,
+    // and we track the paths in `harPaths` so the finally block can
+    // merge + scrub them into a single `crawl.har`. `recordHar` is only
+    // settable through newContext options, which is why the factory
+    // signature lives on the pool.
     // ----------------------------------------------------------------
-    let harIndex = 0;
     const dnsCache = new Map<string, string>();
 
     pool = new ContextPool(browser, {
@@ -233,43 +239,20 @@ export async function dig(config: ResolvedConfig): Promise<DigResult> {
         }));
         await ctx.addInitScript(INIT_SCRIPT);
       },
+      contextOptionsFactory: config.noHar
+        ? undefined
+        : (index) => {
+            const harPath = perContextHarPath(config.outputDir, index);
+            harPaths.push(harPath);
+            return {
+              recordHar: {
+                path: harPath,
+                content: config.harIncludeBodies ? 'embed' : 'omit',
+                mode: 'minimal',
+              },
+            };
+          },
     });
-
-    // Because recordHar is only settable via newContext options and our
-    // pool reuses the same options for every context, we take a different
-    // strategy for multi-context HAR recording: create the first context
-    // with the "canonical" recordHar path, and for any additional contexts
-    // that will be created later (when worker count > 1), we build a new
-    // pool option that points each to a unique file.
-    //
-    // Simpler approach that keeps the invariant: replace the whole pool's
-    // contextOptions.recordHar with a factory-ish thunk. Since Playwright
-    // doesn't accept thunks, we instead intercept newContext by wrapping
-    // the browser.
-    //
-    // Wrap the pool's setupContext path so the *first* newContext() call
-    // uses recordHar path crawl.har.0.partial, the next crawl.har.1.partial,
-    // etc. We accomplish that by constructing a fresh ContextPool per
-    // concurrency slot is overkill — instead, monkeypatch browser.newContext
-    // via our own wrapper.
-    //
-    // Bail early: for the single-context case (concurrency === 1) we keep
-    // the original path crawl.har. For concurrency > 1, we route each
-    // context to a numbered partial.
-    const realNewContext = browser.newContext.bind(browser);
-    (browser as unknown as { newContext: typeof realNewContext }).newContext = async (opts) => {
-      const merged = { ...(opts ?? {}) };
-      if (!config.noHar) {
-        const harPath = perContextHarPath(config.outputDir, harIndex++);
-        harPaths.push(harPath);
-        merged.recordHar = {
-          path: harPath,
-          content: config.harIncludeBodies ? 'embed' : 'omit',
-          mode: 'minimal',
-        };
-      }
-      return realNewContext(merged);
-    };
 
     // ----------------------------------------------------------------
     // 4. Initialize frontier

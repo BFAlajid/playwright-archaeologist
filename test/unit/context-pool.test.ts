@@ -449,6 +449,105 @@ describe('ContextPool', () => {
   });
 
   // -----------------------------------------------------------------------
+  // contextOptionsFactory hook
+  // -----------------------------------------------------------------------
+
+  describe('contextOptionsFactory', () => {
+    it('is called once per newly-created context with a monotonic index', async () => {
+      const factory = vi.fn().mockImplementation((i: number) => ({
+        recordHar: { path: `/tmp/crawl.har.${i}.partial` },
+      }));
+      const pool = new ContextPool(
+        browser,
+        defaultOptions({ concurrency: 3, contextOptionsFactory: factory }),
+      );
+
+      await pool.acquire();
+      await pool.acquire();
+      await pool.acquire();
+
+      expect(factory).toHaveBeenCalledTimes(3);
+      expect(factory).toHaveBeenNthCalledWith(1, 0);
+      expect(factory).toHaveBeenNthCalledWith(2, 1);
+      expect(factory).toHaveBeenNthCalledWith(3, 2);
+    });
+
+    it('merges factory-returned options on top of base contextOptions', async () => {
+      const base = { bypassCSP: true, acceptDownloads: false };
+      const factory = (i: number) => ({
+        recordHar: { path: `/tmp/har.${i}` },
+        locale: 'en-US',
+      });
+      const pool = new ContextPool(
+        browser,
+        defaultOptions({ contextOptions: base, contextOptionsFactory: factory }),
+      );
+
+      await pool.acquire();
+
+      expect(browser.newContext).toHaveBeenCalledWith(
+        expect.objectContaining({
+          bypassCSP: true,
+          acceptDownloads: false,
+          locale: 'en-US',
+          recordHar: { path: '/tmp/har.0' },
+        }),
+      );
+    });
+
+    it('factory-returned keys override base contextOptions on conflict', async () => {
+      const base = { locale: 'en-GB', bypassCSP: true };
+      const factory = () => ({ locale: 'ja-JP' });
+      const pool = new ContextPool(
+        browser,
+        defaultOptions({ contextOptions: base, contextOptionsFactory: factory }),
+      );
+
+      await pool.acquire();
+
+      expect(browser.newContext).toHaveBeenCalledWith(
+        expect.objectContaining({ locale: 'ja-JP', bypassCSP: true }),
+      );
+    });
+
+    it('is not invoked when acquiring an idle (reused) context', async () => {
+      const factory = vi.fn().mockReturnValue({});
+      const pool = new ContextPool(
+        browser,
+        defaultOptions({ concurrency: 1, contextOptionsFactory: factory }),
+      );
+
+      const ctx = await pool.acquire();
+      await pool.release(ctx);
+      const reused = await pool.acquire();
+
+      expect(reused).toBe(ctx);
+      expect(factory).toHaveBeenCalledTimes(1);
+    });
+
+    it('increments the index on recycle (new context gets the next index)', async () => {
+      const factory = vi.fn().mockReturnValue({});
+      const pool = new ContextPool(
+        browser,
+        defaultOptions({
+          concurrency: 1,
+          recycleAfter: 1,
+          contextOptionsFactory: factory,
+        }),
+      );
+
+      const ctx1 = await pool.acquire();
+      await pool.release(ctx1); // pageCount reaches recycleAfter -> close
+      const ctx2 = await pool.acquire(); // fresh context
+
+      expect(ctx2).not.toBe(ctx1);
+      expect(factory).toHaveBeenCalledTimes(2);
+      expect(factory).toHaveBeenNthCalledWith(1, 0);
+      expect(factory).toHaveBeenNthCalledWith(2, 1);
+    });
+  });
+
+  // -----------------------------------------------------------------------
   // drain
   // -----------------------------------------------------------------------
 

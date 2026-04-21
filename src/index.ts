@@ -1,18 +1,44 @@
 /**
- * playwright-archaeologist — programmatic API entry point.
+ * playwright-archaeologist — public programmatic API.
+ *
+ * This module is the stable 0.x entry point. Only the exports listed here are
+ * covered by semver. Internal helpers that used to live here (scanPage,
+ * probeForms, Frontier, escape helpers, etc.) have moved to the deep import
+ * path `playwright-archaeologist/internal` and may change at any time.
  *
  * Usage:
- *   import { dig } from 'playwright-archaeologist';
+ *   import { dig, resolveConfig } from 'playwright-archaeologist';
+ *   const config = resolveConfig({ targetUrl: 'https://example.com' });
  *   const result = await dig(config);
  */
 
+// ---------------------------------------------------------------------------
+// Core entry point
+// ---------------------------------------------------------------------------
 export { dig } from './crawl/orchestrator.js';
 
-// Configuration types
-export type { CrawlConfig, ResolvedConfig, Viewport, OutputFormat, DiffConfig } from './types/config.js';
-export { CrawlConfigSchema, DiffConfigSchema, ViewportSchema, parseViewport, normalizeEntryUrl, resolveConfig } from './types/config.js';
+// ---------------------------------------------------------------------------
+// Configuration
+// ---------------------------------------------------------------------------
+export type {
+  CrawlConfig,
+  ResolvedConfig,
+  Viewport,
+  OutputFormat,
+  DiffConfig,
+} from './types/config.js';
+export {
+  CrawlConfigSchema,
+  DiffConfigSchema,
+  ViewportSchema,
+  parseViewport,
+  normalizeEntryUrl,
+  resolveConfig,
+} from './types/config.js';
 
-// Artifact types
+// ---------------------------------------------------------------------------
+// Artifact / result types
+// ---------------------------------------------------------------------------
 export type {
   DigResult,
   CrawlResult,
@@ -26,7 +52,9 @@ export type {
   BundleManifest,
 } from './types/artifacts.js';
 
-// Error types
+// ---------------------------------------------------------------------------
+// Error hierarchy
+// ---------------------------------------------------------------------------
 export {
   ArchaeologistError,
   ConfigError,
@@ -38,46 +66,40 @@ export {
   BundleError,
 } from './types/errors.js';
 
-// Logger
-export { Logger, logger } from './utils/logger.js';
-
-// Collectors
-export { scanPage } from './collectors/page-scanner.js';
-export { captureScreenshots } from './collectors/screenshot-capturer.js';
-export { probeForms } from './collectors/form-prober.js';
-export { createNetworkLogger } from './collectors/network-logger.js';
-
-// Auth
-export { executeAuth, detectAuthFailure, refreshAuth } from './auth/auth-handler.js';
+// ---------------------------------------------------------------------------
+// Auth — types only. Auth execution is internal; callers supply an auth
+// script path via config and let `dig` orchestrate the flow.
+// ---------------------------------------------------------------------------
 export type { AuthOptions, AuthResult } from './auth/auth-handler.js';
 
-// Crawl utilities
-export { Frontier } from './crawl/frontier.js';
+// ---------------------------------------------------------------------------
+// Report generation
+// ---------------------------------------------------------------------------
+export { generateReportHtml } from './report/html/template.js';
 
-// Assembler
-export { groupEndpoints } from './assembler/api-grouper.js';
-export { buildFlowGraph, generateMermaidDefinition, detectCycles } from './assembler/flow-graph.js';
-
-// Report
-export { generateReportHtml, generateMermaidSvgString } from './report/html/template.js';
-export { escapeHtml, escapeAttribute, escapeJsonInHtml } from './report/html/escape.js';
-
-// Progress
-export { ProgressTracker } from './utils/progress.js';
-
-// Bundle
+// ---------------------------------------------------------------------------
+// Bundle creation
+// ---------------------------------------------------------------------------
 export { createBundle } from './bundle/bundle-creator.js';
 
-// Diff
+// ---------------------------------------------------------------------------
+// Diffing
+// ---------------------------------------------------------------------------
 export { diffBundles } from './diff/diff-engine.js';
 export { generateDiffReportHtml } from './diff/diff-report.js';
 export { diffScreenshotPair } from './diff/screenshot-diff.js';
 export type { ScreenshotDiffOptions, ScreenshotDiffResult } from './diff/screenshot-diff.js';
 
+// ---------------------------------------------------------------------------
 // OpenAPI
-export { generateOpenApiSpec, writeOpenApiSpec } from './report/openapi-output.js';
+// ---------------------------------------------------------------------------
+export { generateOpenApiSpec } from './report/openapi-output.js';
 
-// Collector plugins (programmatic API — see README section "Plugins")
+// ---------------------------------------------------------------------------
+// Collector plugin contract — the supported extension point for adding
+// per-page data capture. Prefer writing a Collector over importing individual
+// internal collectors.
+// ---------------------------------------------------------------------------
 export { CollectorRegistry, DEFAULT_COLLECTOR_TIMEOUT_MS } from './plugins/registry.js';
 export type { Collector, CollectorContext, CollectorResult } from './plugins/types.js';
 export { AxeCollector } from './plugins/axe-collector.js';

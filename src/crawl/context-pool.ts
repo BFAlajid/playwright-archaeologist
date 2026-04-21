@@ -32,6 +32,14 @@ export interface ContextPoolOptions {
    * safely await async setup.
    */
   setupContext?: (context: BrowserContext) => Promise<void>;
+  /**
+   * Optional factory producing per-context options. Called once per new
+   * context creation with the creation index (0, 1, 2, ...). The returned
+   * object is merged on top of the base `contextOptions` (and
+   * `storageState` if set). Use to set per-context HAR paths, per-context
+   * storage state, etc.
+   */
+  contextOptionsFactory?: (index: number) => Record<string, unknown>;
 }
 
 interface PoolEntry {
@@ -46,6 +54,14 @@ export class ContextPool {
   private readonly contextOptions: Record<string, unknown>;
   private readonly storageState?: string;
   private readonly setupContext?: (context: BrowserContext) => Promise<void>;
+  private readonly contextOptionsFactory?: (index: number) => Record<string, unknown>;
+
+  /**
+   * Monotonic creation counter passed to `contextOptionsFactory`. First
+   * context created is index 0, next is 1, etc. Never decremented, even
+   * when contexts are recycled.
+   */
+  private creationIndex = 0;
 
   /** Contexts currently in use by callers */
   private acquired: Map<BrowserContext, PoolEntry> = new Map();
@@ -87,6 +103,7 @@ export class ContextPool {
     this.contextOptions = options.contextOptions;
     this.storageState = options.storageState;
     this.setupContext = options.setupContext;
+    this.contextOptionsFactory = options.contextOptionsFactory;
   }
 
   /** All contexts that have ever been created by this pool. */
@@ -215,6 +232,14 @@ export class ContextPool {
     const opts: Record<string, unknown> = { ...this.contextOptions };
     if (this.storageState !== undefined) {
       opts.storageState = this.storageState;
+    }
+    // Factory is invoked synchronously BEFORE newContext() so the merged
+    // options shape reaches Playwright. The index is monotonic across the
+    // pool lifetime — never reused, never decremented on recycle.
+    if (this.contextOptionsFactory) {
+      const index = this.creationIndex++;
+      const extra = this.contextOptionsFactory(index);
+      Object.assign(opts, extra);
     }
     const context = await this.browser.newContext(opts);
     this.allContexts.push(context);

@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "description": "Performance budgets for playwright-archaeologist. All times in milliseconds, memory in megabytes, sizes in kilobytes.",
+  "description": "Performance budgets for playwright-archaeologist. All times in milliseconds, memory in megabytes, sizes in kilobytes. Bench names must include the first 8 characters of a key (case-insensitive) for enforce-budget.test.ts to match them — see enforce-budget.test.ts for the matching logic.",
   "version": 1,
 
   "crawl": {
@@ -8,221 +8,122 @@
       "target": 5000,
       "max": 10000,
       "unit": "ms",
-      "notes": "Simulated with mock browser (no real network). Measures orchestrator + frontier + collector overhead only."
+      "notes": "Simulated with mock browser (no real network). Measures orchestrator + frontier + collector overhead only. Not measured by the current bench suite — tracked here for documentation."
     },
     "timeToProcess100Pages": {
       "target": 30000,
       "max": 60000,
       "unit": "ms",
-      "notes": "With concurrency=3, mock browser. ~300ms per page budget including all collector passes."
+      "notes": "With concurrency=3, mock browser. ~300ms per page budget including all collector passes. Not measured by the current bench suite."
     },
     "timeToProcess500Pages": {
       "target": 120000,
       "max": 240000,
       "unit": "ms",
-      "notes": "With concurrency=3, mock browser. Context recycling every 50 pages."
+      "notes": "With concurrency=3, mock browser. Context recycling every 50 pages. Not measured by the current bench suite."
     }
   },
 
   "frontier": {
     "enqueue10000Urls": {
       "target": 50,
-      "max": 200,
+      "max": 300,
       "unit": "ms",
-      "notes": "Includes URL normalization and dedup check per enqueue."
+      "notes": "Includes URL normalization and dedup check per enqueue. Matches bench `enqueue 10000 URLs through Frontier`."
     },
     "dequeue10000Urls": {
       "target": 20,
-      "max": 100,
+      "max": 200,
       "unit": "ms",
-      "notes": "Pure FIFO dequeue. Array.shift() has O(n) cost; may need circular buffer if exceeded."
-    },
-    "has10000UrlCheck": {
-      "target": 0.01,
-      "max": 0.1,
-      "unit": "ms",
-      "notes": "Per-lookup. Set.has() should be O(1) amortized."
+      "notes": "Dequeue-until-empty over a pre-filled frontier. Matches bench `dequeue 10000 URLs from a pre-filled Frontier`."
     },
     "urlNormalization": {
-      "target": 0.01,
-      "max": 0.05,
-      "unit": "ms",
-      "notes": "Per URL. Called 25,000 times for a 500-page crawl with 50 links per page."
-    },
-    "memoryAt100Urls": {
-      "target": 1,
-      "max": 5,
-      "unit": "MB",
-      "notes": "RSS delta after loading 100 URLs into frontier."
-    },
-    "memoryAt10000Urls": {
-      "target": 10,
-      "max": 30,
-      "unit": "MB",
-      "notes": "RSS delta after loading 10,000 URLs. Average URL ~100 bytes + Set overhead."
-    },
-    "memoryAt50000Urls": {
       "target": 50,
-      "max": 100,
-      "unit": "MB",
-      "notes": "Stress test. 50,000 normalized URLs in Set + FrontierEntry objects in array."
+      "max": 300,
+      "unit": "ms",
+      "notes": "10000 calls with varied URL shapes; memoization cache cleared per iteration. Matches bench `urlNormalization: 10000 calls ...`."
     }
   },
 
   "report": {
     "htmlGeneration100Pages": {
-      "target": 500,
-      "max": 2000,
+      "target": 100,
+      "max": 1000,
       "unit": "ms",
-      "notes": "Generates HTML string from in-memory data. No Mermaid rendering. No screenshots."
+      "notes": "generateReportHtml over a 100-page synthetic ReportInput. Matches bench `htmlGeneration100Pages`."
     },
-    "htmlGeneration500Pages": {
-      "target": 2000,
+    "htmlGeneration1000Pages": {
+      "target": 1000,
       "max": 5000,
       "unit": "ms",
-      "notes": "Generates HTML string from in-memory data. Includes template literals and JSON serialization."
+      "notes": "generateReportHtml over a 1000-page synthetic ReportInput. Matches bench `htmlGeneration1000Pages`."
     },
-    "base64Encode100Thumbnails": {
+    "htmlGeneration10000Pages": {
+      "target": 10000,
+      "max": 30000,
+      "unit": "ms",
+      "notes": "generateReportHtml over a 10000-page synthetic ReportInput. Primarily a ceiling to detect quadratic regressions — the real tool rarely sees this many pages. Matches bench `htmlGeneration10000Pages`."
+    },
+    "diffReportGeneration": {
       "target": 100,
-      "max": 500,
+      "max": 1000,
       "unit": "ms",
-      "notes": "Encode 100 x 8KB JPEG thumbnails to base64 data URIs."
-    },
-    "base64Encode500Thumbnails": {
-      "target": 500,
-      "max": 2000,
-      "unit": "ms",
-      "notes": "Encode 500 x 8KB JPEG thumbnails to base64 data URIs."
-    },
-    "htmlFileSize100Pages": {
-      "target": 2048,
-      "max": 10240,
-      "unit": "KB",
-      "notes": "Report HTML file size for 100-page crawl. Includes inlined CSS/JS, JSON data, base64 thumbnails."
-    },
-    "htmlFileSize500Pages": {
-      "target": 8192,
-      "max": 20480,
-      "unit": "KB",
-      "notes": "Report HTML file size for 500-page crawl. Must stay under 20MB for browser rendering."
-    },
-    "peakRssDuringGeneration": {
-      "target": 200,
-      "max": 500,
-      "unit": "MB",
-      "notes": "Peak RSS during report generation for 500-page dataset. String concatenation is the primary memory concern."
-    },
-    "jsonSerializationTime": {
-      "target": 50,
-      "max": 200,
-      "unit": "ms",
-      "notes": "JSON.stringify of the embedded report data object for a 500-page crawl."
+      "notes": "generateDiffReportHtml over a synthetic DiffResult (30 added / 10 removed / 50 changed routes). Matches bench `diffReportGeneration`."
     }
   },
 
   "diff": {
-    "sha256Hash100Screenshots": {
+    "pixelDiff100x100": {
       "target": 50,
-      "max": 200,
-      "unit": "ms",
-      "notes": "SHA-256 of 100 x 200KB PNG buffers. Used for fast-path skip of unchanged screenshots."
-    },
-    "pixelmatch10Screenshots": {
-      "target": 500,
-      "max": 2000,
-      "unit": "ms",
-      "notes": "pixelmatch comparison of 10 changed 1280x720 screenshots (~50ms each)."
-    },
-    "pixelmatch100Screenshots": {
-      "target": 5000,
-      "max": 15000,
-      "unit": "ms",
-      "notes": "pixelmatch comparison of 100 changed 1280x720 screenshots. Worst case: all pages changed."
-    },
-    "jsondiffpatch1000Endpoints": {
-      "target": 100,
       "max": 500,
       "unit": "ms",
-      "notes": "jsondiffpatch of two API maps with 1000 endpoints each. Includes objectHash matching."
+      "notes": "diffScreenshotPair over a 100x100 PNG pair with a 1% patch, no heatmap emitted. Matches bench `pixelDiff100x100`."
     },
-    "zipCreation100Pages": {
-      "target": 2000,
+    "pixelDiff1000x1000": {
+      "target": 1000,
       "max": 5000,
       "unit": "ms",
-      "notes": "Create .archaeologist ZIP bundle for 100-page crawl. PNGs stored uncompressed, JSON deflated."
-    },
-    "zipExtraction100Pages": {
-      "target": 1000,
-      "max": 3000,
-      "unit": "ms",
-      "notes": "Extract all entries from a 100-page .archaeologist ZIP bundle."
+      "notes": "diffScreenshotPair over a 1000x1000 PNG pair with a 1% patch and heatmap emit. PNG decode + pixelmatch + PNG encode dominate. Matches bench `pixelDiff1000x1000`."
     },
     "diffTotal100Pages": {
-      "target": 7000,
-      "max": 20000,
+      "target": 2000,
+      "max": 10000,
       "unit": "ms",
-      "notes": "Full diff pipeline: extract + hash + pixelmatch (10% changed) + jsondiffpatch + report."
+      "notes": "diffBundles end-to-end: write two 100-route bundles to tmp, then run the full diff pipeline. Matches bench `diffTotal100Pages`."
     },
     "diffTotal500Pages": {
-      "target": 15000,
-      "max": 45000,
+      "target": 10000,
+      "max": 30000,
       "unit": "ms",
-      "notes": "Full diff pipeline for 500-page bundles. Assumes 10% of screenshots actually changed."
-    }
-  },
-
-  "bundle": {
-    "size100Pages": {
-      "target": 51200,
-      "max": 153600,
-      "unit": "KB",
-      "notes": "100 pages x ~500KB PNG avg + JSON data. ~50MB target, ~150MB max."
-    },
-    "size500Pages": {
-      "target": 256000,
-      "max": 768000,
-      "unit": "KB",
-      "notes": "500 pages x ~500KB PNG avg + JSON data. ~250MB target, ~750MB max."
-    }
-  },
-
-  "memory": {
-    "rssMaxDuring500PageCrawl": {
-      "target": 500,
-      "max": 1500,
-      "unit": "MB",
-      "notes": "Peak RSS during 500-page crawl with concurrency=3. Includes 3 browser contexts. Warn at 1GB, pause at 1.5GB."
-    },
-    "rssWarningThreshold": {
-      "value": 1024,
-      "unit": "MB",
-      "notes": "Log warning when RSS exceeds this. Triggers reduced concurrency."
-    },
-    "rssPauseThreshold": {
-      "value": 1536,
-      "unit": "MB",
-      "notes": "Pause new context creation when RSS exceeds this. Wait for contexts to close."
+      "notes": "diffBundles end-to-end on 500-route synthetic bundles. Matches bench `diffTotal500Pages`."
     }
   },
 
   "assembler": {
-    "apiGrouperWith5000Requests": {
-      "target": 200,
-      "max": 1000,
-      "unit": "ms",
-      "notes": "Group 5000 captured API requests by parameterized pattern. Includes URL parsing and regex matching."
-    },
-    "routeTreeWith500Urls": {
-      "target": 50,
-      "max": 200,
-      "unit": "ms",
-      "notes": "Build hierarchical route tree from 500 flat URLs."
-    },
-    "flowGraphWith500Nodes": {
+    "routeTreeWith1000Urls": {
       "target": 100,
       "max": 500,
       "unit": "ms",
-      "notes": "Build navigation graph with 500 nodes and ~2000 edges. Includes cycle detection."
+      "notes": "buildRouteTree over 1000 PageVisitResults with varying depth (2-7 segments). Matches bench `routeTreeWith1000Urls`."
+    },
+    "buildAssembledArtifacts500Pages": {
+      "target": 200,
+      "max": 2000,
+      "unit": "ms",
+      "notes": "Full assembler pipeline (route tree + routes + API endpoints + flow graph + screenshot manifest) over a synthetic 500-page CrawlResult. Matches bench `buildAssembledArtifacts over 500 synthetic PageVisitResults`."
+    }
+  },
+
+  "memory": {
+    "rssWarningThreshold": {
+      "value": 1024,
+      "unit": "MB",
+      "notes": "Log warning when RSS exceeds this. Triggers reduced concurrency. Not enforced by the bench suite — consumed by the runtime orchestrator."
+    },
+    "rssPauseThreshold": {
+      "value": 1536,
+      "unit": "MB",
+      "notes": "Pause new context creation when RSS exceeds this. Wait for contexts to close. Not enforced by the bench suite."
     }
   }
 }

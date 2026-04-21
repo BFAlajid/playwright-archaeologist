@@ -35,6 +35,18 @@ npx playwright-archaeologist dig https://example.com
 
 ---
 
+## Report preview
+
+The generated `report.html` is a single standalone file with sortable tables,
+filter dropdowns per section, dark mode, semantic HTML landmarks, and
+keyboard-accessible screenshot lightbox. See `docs/RECIPES.md` for how to
+interpret specific sections.
+
+<!-- TODO: add docs/images/report-screenshot.png once the tool is run
+     against a real site. Keep under 400 KB. -->
+
+---
+
 ## Features
 
 - **Zero source code access** — works on any running web app, staging or production
@@ -50,6 +62,17 @@ npx playwright-archaeologist dig https://example.com
 - **Visual regression** — pixel-accurate screenshot diffs with colored heatmap PNGs (`pa diff`)
 - **Real concurrency** — `--concurrency N` runs N parallel browser contexts against the frontier
 - **Plugin API** — programmatic `Collector` interface for adding custom per-page data capture
+
+---
+
+## Comparison with other tools
+
+| Tool | What it does | How `pa` differs |
+|---|---|---|
+| Playwright codegen | Records a single user session as a test script. | `pa` explores the app breadth-first and emits a full behavioral spec, not one script. |
+| Screaming Frog | SEO-focused HTML crawler; inspects meta, links, headings. | `pa` is SPA-aware (Navigation/History/MutationObserver) and also captures forms, APIs, screenshots, and regression bundles. |
+| Crawlee | Low-level Node crawling framework. You write the logic. | `pa` is a ready-to-run CLI that produces a reviewable HTML report and OpenAPI spec out of the box. |
+| httrack | Mirrors static HTML for offline viewing. | `pa` records behavior (forms, API calls, flow graph) and ignores byte-for-byte asset archival. |
 
 ---
 
@@ -300,31 +323,22 @@ for (const page of result.pages) {
 
 Collectors run with a 30-second per-plugin timeout; a failing plugin records an error on the page but does not stop the crawl.
 
-### Using individual collectors
+### Using individual collectors (advanced)
+
+The standalone collectors (`scanPage`, `probeForms`, `captureScreenshots`,
+`createNetworkLogger`) are no longer part of the public API. For new code,
+implement a `Collector` plugin — see the section above. If you still need
+direct access, they live behind the unstable deep-import path:
 
 ```typescript
-import { scanPage, probeForms, captureScreenshots } from 'playwright-archaeologist';
-import { chromium } from 'playwright';
-
-const browser = await chromium.launch();
-const context = await browser.newContext();
-const page = await context.newPage();
-
-await page.goto('https://myapp.com/login');
-
-// Scan page structure
-const scan = await scanPage(page);
-
-// Probe forms
-const forms = await probeForms(page);
-
-// Capture screenshots
-const screenshots = await captureScreenshots(page, {
-  viewport: { width: 1280, height: 720 },
-});
-
-await browser.close();
+import {
+  scanPage,
+  probeForms,
+  captureScreenshots,
+} from 'playwright-archaeologist/internal';
 ```
+
+This path is not covered by semver. See the "Stability" section below.
 
 ---
 
@@ -501,6 +515,30 @@ src/
 | `ERR_BUNDLE` | BundleError | Bundle I/O or integrity failure | Check disk space and permissions |
 
 Exit codes: `0` = success (or identical diff), `1` = changes detected (diff), `2` = error.
+
+---
+
+## Stability
+
+Only the top-level `playwright-archaeologist` import is covered by semver in
+the `0.x` line:
+
+```typescript
+// Stable. Safe to depend on.
+import { dig, resolveConfig, diffBundles, CollectorRegistry } from 'playwright-archaeologist';
+```
+
+The deep import path exists for tests and advanced embedding scenarios but
+is explicitly **not stable**. Names, signatures, and behaviors may change in
+any release, including patch releases:
+
+```typescript
+// UNSTABLE. No semver guarantees. Pin exact versions if you use this.
+import { Frontier, scanPage } from 'playwright-archaeologist/internal';
+```
+
+If you find yourself reaching for `/internal` to build a real feature,
+consider opening an issue — that function probably belongs in the public API.
 
 ---
 

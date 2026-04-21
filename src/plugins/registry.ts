@@ -5,12 +5,17 @@
  * CollectorContext with per-collector timeout and error isolation.
  *
  *   - Default per-collector timeout: 30 000 ms.
+ *   - Collectors run in parallel via Promise.all. The wall-clock cost per
+ *     page is therefore bounded by max(slowest plugin, timeoutMs) rather
+ *     than the sum of all plugins.
  *   - A collector that throws is recorded with `error` (string message) and
- *     the remaining collectors still run.
- *   - A collector that exceeds the timeout is aborted cooperatively (the
- *     pending promise is detached) and reported with an `error` message.
- *     Plugins that ignore cancellation may continue running in the
- *     background; callers should size their plugins to respect the limit.
+ *     does not affect sibling collectors.
+ *   - A collector that exceeds the timeout is abandoned (the pending promise
+ *     is detached) and reported with an `error` message. Plugins that ignore
+ *     cancellation may continue running in the background; callers should
+ *     size their plugins to respect the limit.
+ *   - The returned CollectorResult[] preserves registration order regardless
+ *     of completion order.
  */
 
 import type { Collector, CollectorContext, CollectorResult } from './types.js';
@@ -48,35 +53,47 @@ export class CollectorRegistry {
   }
 
   /**
-   * Run all registered collectors sequentially against `ctx`.
+   * Run all registered collectors in parallel against `ctx`.
    *
    * Errors and timeouts are captured per collector — this method never
-   * throws. Returned array order matches registration order.
+   * throws. Returned array order matches registration order, even when
+   * completion order differs.
    */
   async runAll(ctx: CollectorContext, options: RunAllOptions = {}): Promise<CollectorResult[]> {
     const timeoutMs = options.timeoutMs ?? DEFAULT_COLLECTOR_TIMEOUT_MS;
-    const results: CollectorResult[] = [];
 
-    for (const collector of this.collectors) {
-      const start = Date.now();
-      try {
-        const data = await runWithTimeout(collector, ctx, timeoutMs);
-        results.push({
-          name: collector.name,
-          durationMs: Date.now() - start,
-          data,
-        });
-      } catch (err: unknown) {
-        const message = err instanceof Error ? err.message : String(err);
-        results.push({
-          name: collector.name,
-          durationMs: Date.now() - start,
-          error: message,
-        });
-      }
-    }
+    return Promise.all(this.collectors.map((c) => runOne(c, ctx, timeoutMs)));
+  }
+}
 
-    return results;
+/**
+ * Run a single collector with its own timeout and error envelope.
+ *
+ * Always resolves — never rejects — so callers may use `Promise.all`
+ * without losing sibling results. Each invocation captures its own start
+ * time so reported `durationMs` reflects that collector's share of the
+ * wall clock, independent of peers.
+ */
+async function runOne(
+  collector: Collector,
+  ctx: CollectorContext,
+  timeoutMs: number,
+): Promise<CollectorResult> {
+  const start = Date.now();
+  try {
+    const data = await runWithTimeout(collector, ctx, timeoutMs);
+    return {
+      name: collector.name,
+      durationMs: Date.now() - start,
+      data,
+    };
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    return {
+      name: collector.name,
+      durationMs: Date.now() - start,
+      error: message,
+    };
   }
 }
 
