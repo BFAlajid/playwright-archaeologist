@@ -7,8 +7,8 @@ dist/
 # Crawl output
 .archaeologist/
 
-# Test & coverage
-coverage/
+# Test & coverage (v8/istanbul report output, not the src/coverage feature)
+/coverage/
 
 # Benchmark results
 bench-results.json

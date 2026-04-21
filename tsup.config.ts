@@ -22,5 +22,6 @@ export default defineConfig({
     'pngjs',
     '@axe-core/playwright',
     'axe-core',
+    '@modelcontextprotocol/sdk',
   ],
 });

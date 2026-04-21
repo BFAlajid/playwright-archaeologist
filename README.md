@@ -148,6 +148,44 @@ pa diff ./old-bundle ./new-bundle --format-html diff-report.html
 pa diff ./old-bundle ./new-bundle --format-json diff-report.json
 ```
 
+### Multi-environment diff (one-line CI)
+
+`pa diff-env` crawls two environments in parallel, bundles each, and produces
+a regression diff — all in a single command. Designed for CI pipelines that
+compare staging vs. production on every pull request.
+
+```bash
+# Diff two environments and fail the build on any change
+pa diff-env https://staging.myapp.com https://prod.myapp.com \
+  --output ./diff-env-output \
+  --format junit \
+  --fail-on any
+```
+
+Output layout:
+
+```
+diff-env-output/
+  a/bundle/            Full crawl bundle for env A
+  b/bundle/            Full crawl bundle for env B
+  diff/report.{html,json,md,xml}   Diff report in the requested format
+  diff/heatmaps/       Pixel-diff heatmap PNGs (when applicable)
+```
+
+Useful flags:
+
+| Flag | Purpose |
+|---|---|
+| `--format <fmt>` | Output format: `html`, `json`, `junit`, or `markdown` (default `html`) |
+| `--fail-on <type>` | Exit 1 when this change category appears: `any`, `routes-removed`, `routes-changed`, `forms`, `api`, `screenshots`, `none` (default `any`) |
+| `--label-a <str>` / `--label-b <str>` | Human labels (default: URL hostname) |
+| `--ignore-fields <list>` | Comma-separated fields to ignore in API diff |
+| `--threshold <n>` / `--max-ratio <n>` | Pixel-diff tuning, forwarded to the diff engine |
+
+All `pa dig` crawl knobs (`--depth`, `--max-pages`, `--concurrency`,
+`--timeout`, `--include`, `--exclude`, `--auth`, `--cookies`, `--viewport`,
+`--allow-private`) are inherited and apply to BOTH crawls.
+
 ### Emit Playwright tests from a crawl
 
 ```bash
@@ -172,6 +210,75 @@ Useful flags:
 | `--forms-only` | Skip `smoke`, `flows`, and `api`; emit form submissions only |
 | `--base-url <url>` | Rewrite emitted URLs to point at a different environment (e.g. staging in CI) |
 | `--filter-by-tag <tags>` | Comma-separated URL-path fragments; only emit tests whose URLs match one |
+
+### Measure Playwright test coverage against a crawl
+
+```bash
+# Which crawl-discovered routes have no matching Playwright test?
+pa coverage ./baseline/bundle --tests ./tests -o ./coverage-report.html
+
+# Fail the build when coverage drops below 80%
+pa coverage ./baseline/bundle --tests ./tests --fail-on 80 \
+  --format junit -o ./coverage.xml
+```
+
+The coverage command parses every `.spec.ts` / `.test.ts` / `.mjs` file in the
+given directory, extracts `page.goto(...)` / `request.get(...)` / etc. calls,
+and compares them against the bundle's sitemap and API map. Uncovered routes
+and API endpoints show up in the HTML/JSON/Markdown/JUnit report and in the
+exit status when `--fail-on <pct>` is set.
+
+Useful flags:
+
+| Flag | Purpose |
+|---|---|
+| `--format <fmt>` | Output format: `html`, `json`, `markdown`, `junit`, or `both` (HTML + JSON). Default `html` |
+| `--fail-on <pct>` | Exit 1 if overall coverage drops below this percentage. Default `0` (no gating) |
+| `--base-url <url>` | Override the bundle target URL (useful when the bundle was crawled against a different environment than the tests target) |
+| `--ignore <pattern>` | URL glob patterns to exclude from coverage calculations. Repeatable |
+
+### Ask Claude about your crawl (MCP integration)
+
+`pa mcp <bundle>` starts an [MCP](https://modelcontextprotocol.io) stdio server
+that exposes a crawl bundle to Claude Desktop, Claude Code, or any
+MCP-compatible client as a set of queryable resources and tools.
+
+```bash
+# Point pa mcp at a bundle from a previous pa dig run
+pa mcp ./.archaeologist/bundle
+```
+
+Add the server to your Claude Desktop config
+(`~/Library/Application Support/Claude/claude_desktop_config.json` on macOS,
+`%APPDATA%\Claude\claude_desktop_config.json` on Windows):
+
+```jsonc
+{
+  "mcpServers": {
+    "playwright-archaeologist": {
+      "command": "pa",
+      "args": ["mcp", "/absolute/path/to/your/bundle"]
+    }
+  }
+}
+```
+
+Restart Claude Desktop, then ask questions like:
+
+- *"Which forms in this crawl don't have CSRF protection?"*
+- *"Show me every route that returned a 5xx."*
+- *"Are there any serious accessibility violations?"*
+- *"What's the schema of the `/api/users/:id` endpoint?"*
+
+Claude calls the corresponding tool (`find_forms_without_csrf`,
+`list_broken_routes`, `list_accessibility_violations`, `get_api_endpoint`)
+and reads the result as structured JSON. Resources
+(`bundle://sitemap`, `bundle://forms`, `bundle://api-map`, `bundle://flow-graph`)
+expose the raw artifact files for broader queries.
+
+The server is read-only and local — it never writes to the bundle and never
+reaches the network. Restart `pa mcp` after regenerating the bundle;
+it reads the files once on startup.
 
 ### Authenticated crawling
 

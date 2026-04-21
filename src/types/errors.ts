@@ -340,6 +340,35 @@ export class EmitError extends ArchaeologistError {
 }
 
 // ---------------------------------------------------------------------------
+// Coverage errors (bundle or test-dir loading failures for `pa coverage`)
+// ---------------------------------------------------------------------------
+
+export type CoverageErrorReason =
+  | 'bundle_not_found'
+  | 'bundle_malformed'
+  | 'test_dir_not_found'
+  | 'output_dir_not_writable'
+  | 'write_failed';
+
+/**
+ * Thrown when `pa coverage` cannot read the source bundle, cannot scan the
+ * test directory, or cannot write the generated report. Callers receive a
+ * machine-readable `reason` so scripts can distinguish a missing bundle
+ * from a missing test tree.
+ */
+export class CoverageError extends ArchaeologistError {
+  readonly reason: CoverageErrorReason;
+  readonly bundlePath?: string;
+
+  constructor(reason: CoverageErrorReason, message: string, bundlePath?: string, options?: ErrorOptions) {
+    super(message, 'ERR_COVERAGE', options);
+    this.name = 'CoverageError';
+    this.reason = reason;
+    this.bundlePath = bundlePath;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Checkpoint errors (resume compatibility failures)
 // ---------------------------------------------------------------------------
 

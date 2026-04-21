@@ -54,6 +54,62 @@ drift per screenshot.
 
 ---
 
+## Staging vs. production in CI (single command)
+
+`pa diff-env` collapses the two-step recipe above into one parallel command.
+Both environments crawl simultaneously and the diff runs as soon as both
+bundles are ready.
+
+```bash
+pa diff-env https://staging.myapp.com https://prod.myapp.com \
+  --output ./diff-env-output \
+  --format junit \
+  --fail-on routes-removed \
+  --label-a staging --label-b prod
+```
+
+Exit codes:
+
+| `--fail-on` value | Exit 1 when... |
+|---|---|
+| `any` (default) | Any route, form, API, or screenshot changed |
+| `routes-removed` | At least one route was removed |
+| `routes-changed` | Routes were added, removed, or modified |
+| `forms` | A form was added, removed, or modified |
+| `api` | An API endpoint was added, removed, or modified |
+| `screenshots` | A screenshot changed |
+| `none` | Never fail (run for the report only) |
+
+Output layout (under `--output`):
+
+```
+diff-env-output/
+  a/                   Env A crawl (including bundle/)
+  b/                   Env B crawl (including bundle/)
+  diff/                Diff report + heatmaps
+    report.xml         When --format junit
+    report.html        When --format html
+    report.json        When --format json
+    report.md          When --format markdown
+    heatmaps/*.png     Pixel-diff overlays
+```
+
+The one-line log summary at the end (`diff-env: A=<host> B=<host> | +N
+routes, -M routes, ...`) is grep-friendly for CI dashboards. For a GitHub
+Actions workflow, add:
+
+```yaml
+- name: Diff staging vs prod
+  run: pa diff-env "$STAGING_URL" "$PROD_URL" --output ./diff-env-output --format junit --fail-on any
+- name: Upload diff report
+  uses: actions/upload-artifact@v4
+  with:
+    name: diff-env-output
+    path: diff-env-output/
+```
+
+---
+
 ## Multi-viewport responsive audit
 
 Pass a comma-separated viewport list. Each page is captured at every
@@ -249,6 +305,75 @@ pa emit-tests ./staging/bundle -o ./tests/sensitive \
 
 ---
 
+## Which crawl-discovered routes have no test?
+
+Feed an existing Playwright test suite into `pa coverage` alongside a crawl
+bundle and find out which pages and APIs your suite doesn't exercise yet.
+Use it as a CI gate by setting `--fail-on`.
+
+```bash
+# Crawl your app once.
+pa dig https://staging.myapp.com -o ./staging
+
+# Compare a local Playwright suite against the crawl.
+pa coverage ./staging/bundle \
+  --tests ./tests/e2e \
+  -o ./coverage.html
+```
+
+Example output (truncated):
+
+```
+INFO  Coverage: routes 47/62 (75.81%), APIs 12/28 (42.86%), overall 65.56%
+OK    Coverage report: ./coverage.html
+```
+
+Gate a PR on a minimum overall percentage and emit JUnit XML so Jenkins /
+GitLab / CircleCI pipelines render the results as test failures:
+
+```bash
+pa coverage ./staging/bundle \
+  --tests ./tests/e2e \
+  --format junit \
+  --fail-on 80 \
+  -o ./coverage-junit.xml
+```
+
+A common pattern is to ignore telemetry / admin routes that your E2E suite
+will never exercise:
+
+```bash
+pa coverage ./staging/bundle \
+  --tests ./tests/e2e \
+  --ignore '**/api/internal/**' \
+  --ignore '**/admin/**' \
+  --ignore '**/healthz' \
+  -o ./coverage.html
+```
+
+When the bundle was crawled against a different environment than the test
+suite targets (e.g. crawl against staging, tests against prod), use
+`--base-url` to tell the scanner what origin `${process.env.BASE_URL}` and
+similar placeholders should expand to:
+
+```bash
+pa coverage ./prod-bundle \
+  --tests ./tests/e2e \
+  --base-url https://prod.example.com \
+  -o ./coverage.html
+```
+
+Matching rules (heuristic, not a full TypeScript parser):
+
+- Routes are matched by pathname. `?q=foo` and `?q=bar` are treated as the
+  same logical page.
+- APIs are matched by `(method, parameterizedPath)` — a test hitting
+  `/users/42` covers a bundle endpoint at `/users/:id`.
+- Tests with non-literal URL arguments (`page.goto(someVariable)`) are not
+  counted; the scanner only classifies literal string arguments.
+
+---
+
 ## Programmatic plugin example
 
 Implement the `Collector` contract, register it, and let `dig` drive it on
@@ -283,3 +408,50 @@ for (const p of result.pages) {
 Collectors run with a 30-second per-plugin timeout. Throwing inside
 `collect` records the error on that page only; sibling collectors and the
 crawl continue.
+
+---
+
+## Query your crawl from Claude (MCP)
+
+Rather than parsing `api-map.json` or `accessibility.json` by hand, point
+Claude (Desktop or Code) at the bundle over MCP and ask questions in
+English. `pa mcp` starts a local stdio MCP server that exposes the
+bundle as queryable tools and resources.
+
+```bash
+# One-time crawl
+pa dig https://staging.myapp.com --with-a11y -o ./staging
+
+# Start the server (Claude Desktop config does this for you; shown
+# here so you can smoke-test before wiring it into Claude).
+pa mcp ./staging/bundle
+```
+
+Claude Desktop config (`~/Library/Application Support/Claude/claude_desktop_config.json`
+on macOS, `%APPDATA%\Claude\claude_desktop_config.json` on Windows):
+
+```jsonc
+{
+  "mcpServers": {
+    "playwright-archaeologist": {
+      "command": "pa",
+      "args": ["mcp", "/absolute/path/to/staging/bundle"]
+    }
+  }
+}
+```
+
+Useful prompts once it is wired up:
+
+- *"Using playwright-archaeologist, list every POST form that has no
+  CSRF token."* → calls `find_forms_without_csrf`.
+- *"Show me the top 20 critical a11y violations with their help URLs."*
+  → calls `list_accessibility_violations` with `impact: 'critical'`.
+- *"Which routes returned 5xx during the crawl?"* → calls
+  `list_broken_routes` with `min_status: 500`.
+- *"What does the `/api/users/:id` endpoint return?"* → calls
+  `get_api_endpoint` and surfaces the `exampleResponse`.
+
+The server is read-only, local, and never touches the network. It
+reads the bundle once at startup — re-run `pa mcp` after regenerating
+the bundle.

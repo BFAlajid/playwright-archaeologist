@@ -24,6 +24,7 @@ import {
   DiffError,
   EmitError,
   CheckpointMismatchError,
+  CoverageError,
 } from './types/errors.js';
 import { logger } from './utils/logger.js';
 import { dig } from './crawl/orchestrator.js';
@@ -31,8 +32,25 @@ import { diffBundles } from './diff/diff-engine.js';
 import { generateDiffReportHtml } from './diff/diff-report.js';
 import { createBundle } from './bundle/bundle-creator.js';
 import { emitTests } from './emit/test-emitter.js';
+import { startMcpServer } from './mcp/server.js';
 import { AxeCollector } from './plugins/axe-collector.js';
 import type { Collector } from './plugins/types.js';
+import {
+  runDiffEnv,
+  formatDiffEnvSummary,
+  type DiffEnvFormat,
+  type DiffEnvFailOn,
+  type SharedCrawlConfig,
+} from './diff-env/diff-env.js';
+import { scanTestDirectory } from './coverage/test-scanner.js';
+import { computeCoverage } from './coverage/coverage-engine.js';
+import {
+  generateCoverageReportHtml,
+  generateCoverageReportJson,
+  generateCoverageReportMarkdown,
+  generateCoverageReportJUnit,
+} from './coverage/coverage-report.js';
+import { loadBundleForCoverage } from './coverage/bundle-loader.js';
 
 // ---------------------------------------------------------------------------
 // Load package.json for version
@@ -601,6 +619,388 @@ program
   });
 
 // ---------------------------------------------------------------------------
+// `diff-env` command
+// ---------------------------------------------------------------------------
+
+const DIFF_ENV_FORMATS: readonly DiffEnvFormat[] = ['html', 'json', 'junit', 'markdown'] as const;
+const DIFF_ENV_FAIL_ON: readonly DiffEnvFailOn[] = [
+  'any',
+  'routes-removed',
+  'routes-changed',
+  'forms',
+  'api',
+  'screenshots',
+  'none',
+] as const;
+
+program
+  .command('diff-env')
+  .description('Crawl two environments and produce a regression diff report')
+  .argument('<envAUrl>', 'URL for environment A (e.g. https://staging.myapp.com)')
+  .argument('<envBUrl>', 'URL for environment B (e.g. https://prod.myapp.com)')
+
+  // Output
+  .option('-o, --output <dir>', 'Output directory for both crawls + diff (default: ./diff-env-output)')
+
+  // Crawl knobs (forwarded to BOTH envs)
+  .option('-d, --depth <n>', 'Maximum crawl depth', (v) => parseIntOption(v, 'depth'))
+  .option('--max-pages <n>', 'Maximum total pages to visit', (v) => parseIntOption(v, 'max-pages'))
+  .option('-c, --concurrency <n>', 'Parallel browser contexts per env', (v) => parseIntOption(v, 'concurrency'))
+  .option('--timeout <ms>', 'Per-page navigation timeout (ms)', (v) => parseIntOption(v, 'timeout'))
+  .option('--include <pattern>', 'URL glob include pattern (repeatable)', collectArray, [])
+  .option('--exclude <pattern>', 'URL glob exclude pattern (repeatable)', collectArray, [])
+  .option('--auth <script>', 'Path to auth script (applied to BOTH envs)')
+  .option('--cookies <file>', 'Path to cookies JSON file')
+  .option('--viewport <WxH>', 'Viewport dimensions')
+  .option('--with-a11y', 'Run axe-core accessibility audit on each page', false)
+  .option(
+    '--allow-private',
+    'Allow crawling private/internal IP ranges (required for localhost fixtures)',
+    false,
+  )
+  .option('--allow-auth-script', 'Allow running auth scripts that fail static analysis', false)
+
+  // Diff knobs
+  .addOption(
+    new Option('--format <fmt>', 'Diff report format')
+      .choices([...DIFF_ENV_FORMATS])
+      .default('html'),
+  )
+  .option('--ignore-fields <list>', 'Comma-separated fields to ignore in API diff')
+  .option('--threshold <n>', 'Pixel diff threshold 0-1', parseFloat)
+  .option('--max-ratio <n>', 'Max diff ratio 0-100 before marking changed', parseFloat)
+
+  // Labels
+  .option('--label-a <str>', 'Human label for env A (default: hostname)')
+  .option('--label-b <str>', 'Human label for env B (default: hostname)')
+
+  // Exit policy
+  .addOption(
+    new Option('--fail-on <type>', 'Exit 1 when this change category appears')
+      .choices([...DIFF_ENV_FAIL_ON])
+      .default('any'),
+  )
+
+  .option('-v, --verbose', 'Enable debug logging', false)
+
+  .action(async (envAUrl: string, envBUrl: string, opts: Record<string, unknown>) => {
+    if (opts.verbose) {
+      logger.setLevel('debug');
+    }
+
+    try {
+      // --- Normalize both URLs up front so bad input fails fast. ---
+      // resolveConfig inside runDiffEnv will normalize again — that's fine;
+      // URL normalization is idempotent — but early normalization here lets
+      // us surface warnings before any crawl starts.
+      const { url: normA, warnings: warnA } = normalizeEntryUrl(envAUrl);
+      const { url: normB, warnings: warnB } = normalizeEntryUrl(envBUrl);
+      for (const w of [...warnA, ...warnB]) logger.warn(w);
+
+      // --- Validate auth script + cookies file paths, same as dig. ---
+      let authScript: string | undefined;
+      if (typeof opts.auth === 'string') {
+        authScript = resolve(opts.auth);
+        try {
+          accessSync(authScript, constants.R_OK);
+        } catch {
+          throw new AuthError('script_not_found', `Auth script not found: ${authScript}`, authScript);
+        }
+      }
+
+      let cookiesFile: string | undefined;
+      if (typeof opts.cookies === 'string') {
+        cookiesFile = resolve(opts.cookies);
+        try {
+          accessSync(cookiesFile, constants.R_OK);
+        } catch {
+          throw new AuthError('cookie_file_not_found', `Cookies file not found: ${cookiesFile}`, cookiesFile);
+        }
+      }
+
+      let viewport: Viewport | undefined;
+      if (typeof opts.viewport === 'string') {
+        viewport = parseViewportStrict(opts.viewport, 'viewport');
+      }
+
+      const outputDir = resolve(typeof opts.output === 'string' ? opts.output : './diff-env-output');
+
+      // --- Build the shared CrawlConfig subset. ---
+      // resolveConfig inside runDiffEnv will apply defaults and validate;
+      // we only forward fields the user explicitly set so Zod defaults
+      // continue to govern the rest.
+      const shared: SharedCrawlConfig = {};
+      if (opts.depth !== undefined) shared.depth = opts.depth as number;
+      if (opts.maxPages !== undefined) shared.maxPages = opts.maxPages as number;
+      if (opts.concurrency !== undefined) shared.concurrency = opts.concurrency as number;
+      if (opts.timeout !== undefined) shared.timeout = opts.timeout as number;
+      if ((opts.include as string[])?.length > 0) shared.include = opts.include as string[];
+      if ((opts.exclude as string[])?.length > 0) shared.exclude = opts.exclude as string[];
+      if (authScript) shared.authScript = authScript;
+      if (cookiesFile) shared.cookiesFile = cookiesFile;
+      if (viewport) shared.viewport = viewport;
+      if (opts.allowPrivate) shared.allowPrivate = true;
+      if (opts.allowAuthScript) shared.allowAuthScript = true;
+
+      // --- Build diff tuning. ---
+      const diffOptions: { diffThreshold?: number; diffMaxRatio?: number; diffIgnoreFields?: string[] } = {};
+      if (opts.threshold !== undefined) diffOptions.diffThreshold = opts.threshold as number;
+      if (opts.maxRatio !== undefined) diffOptions.diffMaxRatio = opts.maxRatio as number;
+      if (typeof opts.ignoreFields === 'string') {
+        diffOptions.diffIgnoreFields = opts.ignoreFields.split(',').map((s) => s.trim()).filter(Boolean);
+      }
+
+      // --- Register --with-a11y collectors. ---
+      // NOTE: `runDiffEnv` does not yet forward collectors. If --with-a11y
+      // is ever wired through `SharedCrawlConfig`, we'll plug it in here.
+      // For now we accept the flag on the CLI (documented intent) but only
+      // use it when the shared config schema learns `collectors`.
+      if (opts.withA11y) {
+        logger.warn(
+          '--with-a11y accepted but not yet forwarded to diff-env crawls; axe reports will not be produced.',
+        );
+      }
+
+      const format = (typeof opts.format === 'string' ? opts.format : 'html') as DiffEnvFormat;
+      const failOn = (typeof opts.failOn === 'string' ? opts.failOn : 'any') as DiffEnvFailOn;
+
+      logger.info(`Crawling env A (${normA}) and env B (${normB}) in parallel...`);
+
+      const result = await runDiffEnv({
+        envAUrl: normA,
+        envBUrl: normB,
+        outputDir,
+        sharedCrawlConfig: shared,
+        diffOptions,
+        labelA: typeof opts.labelA === 'string' ? opts.labelA : undefined,
+        labelB: typeof opts.labelB === 'string' ? opts.labelB : undefined,
+        format,
+        failOn,
+      });
+
+      logger.success(formatDiffEnvSummary(result));
+      logger.info(`Diff report: ${result.diffReportPath}`);
+      logger.info(`Env A bundle: ${result.bundleAPath}`);
+      logger.info(`Env B bundle: ${result.bundleBPath}`);
+
+      process.exit(result.shouldFail ? 1 : 0);
+    } catch (err) {
+      handleError(err);
+    }
+  });
+
+// ---------------------------------------------------------------------------
+// `mcp` command
+// ---------------------------------------------------------------------------
+
+program
+  .command('mcp <bundle>')
+  .description('Serve bundle artifacts over MCP stdio for Claude or other AI clients')
+  .option('-v, --verbose', 'Enable debug logging on stderr', false)
+  .action(async (bundle: string, opts: Record<string, unknown>) => {
+    if (opts.verbose) {
+      logger.setLevel('debug');
+    }
+    try {
+      const bundleDir = resolve(bundle);
+      try {
+        accessSync(bundleDir, constants.R_OK);
+      } catch {
+        throw new ConfigError('bundle', `Bundle directory not found: ${bundleDir}`, bundleDir);
+      }
+      await startMcpServer(bundleDir);
+      process.exit(0);
+    } catch (err) {
+      handleError(err);
+    }
+  });
+
+// ---------------------------------------------------------------------------
+// `coverage` command
+// ---------------------------------------------------------------------------
+
+program
+  .command('coverage <bundle>')
+  .description(
+    'Report which crawl-discovered routes and APIs have matching Playwright tests',
+  )
+  .requiredOption('--tests <dir>', 'Directory containing Playwright test files')
+  .option('-o, --output <file>', 'Coverage report output path', './coverage-report.html')
+  .option(
+    '--format <fmt>',
+    'Output format: html, json, markdown, junit, or both (html + json)',
+    'html',
+  )
+  .option(
+    '--fail-on <threshold>',
+    'Exit 1 if overall coverage drops below this percentage (0-100, 0 = no gating)',
+    (v: string) => {
+      const n = parseFloat(v);
+      if (!Number.isFinite(n)) {
+        throw new ConfigError('fail-on', `"${v}" is not a valid number for --fail-on.`, v);
+      }
+      if (n < 0 || n > 100) {
+        throw new ConfigError('fail-on', `--fail-on must be between 0 and 100 (got ${n}).`, v);
+      }
+      return n;
+    },
+    0,
+  )
+  .option(
+    '--base-url <url>',
+    'Override bundle target URL (for bundles crawled against a different environment)',
+  )
+  .option(
+    '--ignore <pattern>',
+    'URL glob pattern to ignore from coverage calculations (repeatable)',
+    collectArray,
+    [],
+  )
+  .option('-v, --verbose', 'Enable debug logging', false)
+  .action(async (bundle: string, opts: Record<string, unknown>) => {
+    if (opts.verbose) {
+      logger.setLevel('debug');
+    }
+
+    try {
+      const bundleDir = resolve(bundle);
+      const testsDir = typeof opts.tests === 'string' ? resolve(opts.tests) : '';
+      if (!testsDir) {
+        throw new ConfigError('tests', '--tests <dir> is required.', opts.tests);
+      }
+
+      try {
+        accessSync(testsDir, constants.R_OK);
+      } catch {
+        throw new CoverageError(
+          'test_dir_not_found',
+          `Test directory not found or unreadable: ${testsDir}`,
+          bundleDir,
+        );
+      }
+
+      // Validate --base-url when supplied, but keep the caller's string
+      // verbatim (trailing slash, etc.) so it round-trips predictably.
+      let baseUrl: string | undefined;
+      if (typeof opts.baseUrl === 'string' && opts.baseUrl.length > 0) {
+        try {
+          new URL(opts.baseUrl);
+          baseUrl = opts.baseUrl;
+        } catch {
+          throw new ConfigError('baseUrl', `Invalid --base-url: ${opts.baseUrl}`, opts.baseUrl);
+        }
+      }
+
+      const format = String(opts.format ?? 'html').toLowerCase();
+      const validFormats = ['html', 'json', 'markdown', 'junit', 'both'];
+      if (!validFormats.includes(format)) {
+        throw new ConfigError(
+          'format',
+          `--format must be one of: ${validFormats.join(', ')} (got "${format}").`,
+          opts.format,
+        );
+      }
+
+      const ignorePatterns = Array.isArray(opts.ignore) ? (opts.ignore as string[]) : [];
+
+      logger.info(`Scanning Playwright tests in ${testsDir}`);
+      const refs = await scanTestDirectory(testsDir, { baseUrl });
+      logger.debug(`Found ${refs.length} URL reference(s) in test files.`);
+
+      logger.info(`Loading bundle from ${bundleDir}`);
+      const loaded = await loadBundleForCoverage(bundleDir, baseUrl);
+
+      const report = computeCoverage(
+        {
+          routes: loaded.routes,
+          apis: loaded.apis,
+          bundleTarget: loaded.targetUrl,
+          testDir: testsDir,
+        },
+        refs,
+        { ignorePatterns },
+      );
+
+      logger.info(
+        `Coverage: routes ${report.summary.routesCovered}/${report.summary.routesTotal} (${report.summary.routesPercentage}%), ` +
+          `APIs ${report.summary.apisCovered}/${report.summary.apisTotal} (${report.summary.apisPercentage}%), ` +
+          `overall ${report.summary.overallPercentage}%`,
+      );
+
+      const outputPath = resolve(typeof opts.output === 'string' ? opts.output : './coverage-report.html');
+      const { writeFile, mkdir: mkdirAsync } = await import('node:fs/promises');
+
+      // Ensure the output directory exists.
+      try {
+        await mkdirAsync(dirname(outputPath), { recursive: true });
+      } catch (err) {
+        throw new CoverageError(
+          'output_dir_not_writable',
+          `Cannot create output directory for ${outputPath}: ${err instanceof Error ? err.message : String(err)}`,
+          bundleDir,
+          { cause: err instanceof Error ? err : undefined },
+        );
+      }
+
+      const writes: Array<Promise<void>> = [];
+
+      function pairPath(primary: string, otherExt: string): string {
+        // Swap extension if primary already has .html/.json/etc.; otherwise
+        // append otherExt to the primary path.
+        const lastSep = Math.max(primary.lastIndexOf('/'), primary.lastIndexOf('\\'));
+        const lastDot = primary.lastIndexOf('.');
+        if (lastDot > 0 && lastDot > lastSep) {
+          return `${primary.slice(0, lastDot)}${otherExt}`;
+        }
+        return `${primary}${otherExt}`;
+      }
+
+      async function writeOutput(path: string, content: string): Promise<void> {
+        try {
+          await writeFile(path, content, 'utf-8');
+          logger.success(`Coverage report: ${path}`);
+        } catch (err) {
+          throw new CoverageError(
+            'write_failed',
+            `Failed to write ${path}: ${err instanceof Error ? err.message : String(err)}`,
+            bundleDir,
+            { cause: err instanceof Error ? err : undefined },
+          );
+        }
+      }
+
+      if (format === 'html') {
+        writes.push(writeOutput(outputPath, generateCoverageReportHtml(report)));
+      } else if (format === 'json') {
+        writes.push(writeOutput(outputPath, generateCoverageReportJson(report)));
+      } else if (format === 'markdown') {
+        writes.push(writeOutput(outputPath, generateCoverageReportMarkdown(report)));
+      } else if (format === 'junit') {
+        writes.push(writeOutput(outputPath, generateCoverageReportJUnit(report)));
+      } else if (format === 'both') {
+        // HTML at the primary path, JSON alongside it.
+        writes.push(writeOutput(outputPath, generateCoverageReportHtml(report)));
+        writes.push(writeOutput(pairPath(outputPath, '.json'), generateCoverageReportJson(report)));
+      }
+
+      await Promise.all(writes);
+
+      // Gate on --fail-on threshold.
+      const threshold = typeof opts.failOn === 'number' ? opts.failOn : 0;
+      if (threshold > 0 && report.summary.overallPercentage < threshold) {
+        logger.error(
+          `Coverage ${report.summary.overallPercentage}% is below threshold ${threshold}%.`,
+        );
+        process.exit(1);
+      }
+
+      process.exit(0);
+    } catch (err) {
+      handleError(err);
+    }
+  });
+
+// ---------------------------------------------------------------------------
 // Error handler
 // ---------------------------------------------------------------------------
 
@@ -617,6 +1017,11 @@ function handleError(err: unknown): never {
 
   if (err instanceof DiffError) {
     logger.error(`Diff error: ${err.message}`);
+    process.exit(2);
+  }
+
+  if (err instanceof CoverageError) {
+    logger.error(`Coverage error: ${err.message}`);
     process.exit(2);
   }
 

@@ -65,6 +65,7 @@ export {
   DiffError,
   BundleError,
   EmitError,
+  CoverageError,
 } from './types/errors.js';
 
 // ---------------------------------------------------------------------------
@@ -98,6 +99,19 @@ export { diffScreenshotPair } from './diff/screenshot-diff.js';
 export type { ScreenshotDiffOptions, ScreenshotDiffResult } from './diff/screenshot-diff.js';
 
 // ---------------------------------------------------------------------------
+// Multi-environment diff
+// ---------------------------------------------------------------------------
+export { runDiffEnv, formatDiffEnvSummary, evaluateFailOn } from './diff-env/diff-env.js';
+export type {
+  DiffEnvOptions,
+  DiffEnvResult,
+  DiffEnvDeps,
+  DiffEnvFormat,
+  DiffEnvFailOn,
+  SharedCrawlConfig,
+} from './diff-env/diff-env.js';
+
+// ---------------------------------------------------------------------------
 // OpenAPI
 // ---------------------------------------------------------------------------
 export { generateOpenApiSpec } from './report/openapi-output.js';
@@ -111,3 +125,31 @@ export { CollectorRegistry, DEFAULT_COLLECTOR_TIMEOUT_MS } from './plugins/regis
 export type { Collector, CollectorContext, CollectorResult } from './plugins/types.js';
 export { AxeCollector } from './plugins/axe-collector.js';
 export type { AxeResult, AxeViolation } from './plugins/axe-collector.js';
+
+// ---------------------------------------------------------------------------
+// MCP server — expose a bundle over the Model Context Protocol so Claude
+// or any MCP client can query the crawl via tools + resources.
+// ---------------------------------------------------------------------------
+export { startMcpServer } from './mcp/server.js';
+
+// ---------------------------------------------------------------------------
+// Test coverage overlay — compare a Playwright test directory to a crawl
+// bundle and report routes/APIs with no matching test.
+// ---------------------------------------------------------------------------
+export { scanTestDirectory } from './coverage/test-scanner.js';
+export type { TestReference, ScanOptions } from './coverage/test-scanner.js';
+export { computeCoverage } from './coverage/coverage-engine.js';
+export type {
+  CoverageReport,
+  CoverageRouteEntry,
+  CoverageApiEntry,
+  CoverageSummary,
+  ComputeCoverageInput,
+  ComputeCoverageOptions,
+} from './coverage/coverage-engine.js';
+export {
+  generateCoverageReportHtml,
+  generateCoverageReportJson,
+  generateCoverageReportMarkdown,
+  generateCoverageReportJUnit,
+} from './coverage/coverage-report.js';
