@@ -37,11 +37,20 @@ import { runCrawlLoop } from './crawl-loop.js';
 import { mergeHarFiles } from './har-merger.js';
 import { buildCrawlResult, handleFatalCrawlFailure } from './fatal-handler.js';
 import { writeCrawlOutputs } from './output-writer.js';
+import {
+  createCheckpointState,
+  deleteCheckpoint,
+  readCheckpoint,
+  setupAutoCheckpoint,
+  writeCheckpoint,
+} from './checkpoint.js';
+import { hashConfig } from './config-hash.js';
 
 import { getSecureContextOptions, getSecureLaunchOptions } from '../security/browser-hardening.js';
 import { scrubHarFile } from '../security/har-scrubber.js';
 import { createNetworkGuard } from '../security/network-guard.js';
-import { InstallationError } from '../types/errors.js';
+import { CheckpointMismatchError, InstallationError } from '../types/errors.js';
+import type { CheckpointState } from '../types/artifacts.js';
 import { logger } from '../utils/logger.js';
 import { CollectorRegistry } from '../plugins/registry.js';
 
@@ -180,6 +189,17 @@ export async function dig(config: ResolvedConfig): Promise<DigResult> {
   };
   process.on('SIGINT', sigintHandler);
 
+  // Checkpoint state — populated if --resume hydrates from disk, otherwise
+  // starts empty. Referenced by the auto-checkpoint getState() closure.
+  // Kept at function scope so the finally block can tear down the timer.
+  let autoCheckpoint: { stop: () => void } | undefined;
+  // Visited URLs carried over from a prior run (checkpoint resume).
+  // Passed to the crawl loop to skip re-visiting.
+  let priorVisited: Set<string> | undefined;
+  // Progress counter the loop mutates each time a page finishes — the
+  // auto-checkpoint closure reads it to produce a live snapshot.
+  const progressSink = { pagesVisited: 0 };
+
   try {
     // ----------------------------------------------------------------
     // 1. Pre-flight
@@ -219,6 +239,16 @@ export async function dig(config: ResolvedConfig): Promise<DigResult> {
     // ----------------------------------------------------------------
     const dnsCache = new Map<string, string>();
 
+    // Derive the entry hostname once for the same-site pinning heuristic.
+    // A malformed targetUrl would already have been rejected by
+    // normalizeEntryUrl() during config resolution.
+    let entryHostname: string | undefined;
+    try {
+      entryHostname = new URL(config.targetUrl).hostname.replace(/^\[|\]$/g, '');
+    } catch {
+      entryHostname = undefined;
+    }
+
     pool = new ContextPool(browser, {
       concurrency: Math.max(1, config.concurrency),
       recycleAfter: 50,
@@ -233,9 +263,16 @@ export async function dig(config: ResolvedConfig): Promise<DigResult> {
         // fetching private-network resources via <img>, fetch(), <iframe>,
         // etc. The pre-dequeue isBlockedUrl() in crawl-loop is the first
         // line of defense; this is the second.
+        //
+        // When `config.socketPinning` is true (default), first-party
+        // GET/HEAD requests are fulfilled via a Node HTTPS agent that
+        // connects directly to the pinned IP — closing the TOCTOU window
+        // between our resolver and Playwright's own TCP connect.
         await ctx.route('**', createNetworkGuard({
           allowPrivate: config.allowPrivate,
           dnsCache,
+          pinned: config.socketPinning && !config.allowPrivate,
+          entryHostname,
         }));
         await ctx.addInitScript(INIT_SCRIPT);
       },
@@ -255,11 +292,130 @@ export async function dig(config: ResolvedConfig): Promise<DigResult> {
     });
 
     // ----------------------------------------------------------------
-    // 4. Initialize frontier
+    // 4. Checkpoint resume (optional) + frontier initialization
+    //
+    // If --resume is set AND a checkpoint file exists in outputDir:
+    //   - Verify configHash matches the current config. If not, throw
+    //     CheckpointMismatchError (fatal — the user must choose to delete
+    //     the checkpoint or rerun without --resume).
+    //   - Hydrate the frontier with the prior run's pending URLs.
+    //   - Seed `priorVisited` so the crawl loop skips already-done URLs.
+    //   - Pre-populate `errors` with the prior run's errors.
+    //   - Pre-populate `progressSink.pagesVisited` with the prior count
+    //     so the live checkpoint snapshot stays monotonic.
+    //
+    // If a checkpoint file exists but --resume was NOT set, log a warning
+    // and start fresh. Do NOT delete the checkpoint — the user may have
+    // forgotten the flag and can rerun with it.
     // ----------------------------------------------------------------
+    const configHash = hashConfig(config);
+    const existingCheckpoint = await readCheckpoint(config.outputDir).catch((err: unknown) => {
+      // readCheckpoint throws on malformed JSON or schema violations. A
+      // corrupt checkpoint should not block a fresh crawl — warn and
+      // proceed as if it was absent.
+      const message = err instanceof Error ? err.message : String(err);
+      logger.warn(`Failed to read checkpoint (ignoring): ${message}`);
+      return null;
+    });
+
     const frontier = new Frontier({ maxDepth: config.depth });
-    frontier.enqueue({ url: config.targetUrl, depth: 0 });
+
+    if (config.resume && existingCheckpoint) {
+      if (existingCheckpoint.configHash !== configHash) {
+        throw new CheckpointMismatchError(
+          configHash,
+          existingCheckpoint.configHash,
+          path.join(config.outputDir, '.checkpoint.json'),
+        );
+      }
+
+      // Hydrate pending URLs from the checkpoint frontier. Order matters:
+      // we enqueue in the original BFS order.
+      for (const entry of existingCheckpoint.frontier) {
+        frontier.enqueue({ url: entry.url, depth: entry.depth, referrer: entry.referrer });
+      }
+
+      priorVisited = new Set(existingCheckpoint.visited);
+      errors.push(...existingCheckpoint.errors);
+      progressSink.pagesVisited = existingCheckpoint.pagesVisited;
+
+      logger.info(
+        `Resuming from checkpoint: ${existingCheckpoint.frontier.length} URLs remaining, ` +
+          `${existingCheckpoint.visited.length} already visited`,
+      );
+
+      // If the entry URL is neither in-frontier nor already-visited (e.g.,
+      // the checkpoint was written before the entry URL was enqueued),
+      // enqueue it so the resumed crawl has something to do.
+      if (
+        !priorVisited.has(config.targetUrl) &&
+        !existingCheckpoint.frontier.some((e) => e.url === config.targetUrl)
+      ) {
+        frontier.enqueue({ url: config.targetUrl, depth: 0 });
+      }
+    } else {
+      if (existingCheckpoint && !config.resume) {
+        logger.warn(
+          'Existing checkpoint found at .checkpoint.json but --resume was not set. ' +
+            'Starting a fresh crawl. The checkpoint will be preserved.',
+        );
+      }
+      frontier.enqueue({ url: config.targetUrl, depth: 0 });
+    }
     logger.debug(`Frontier initialized with entry URL: ${config.targetUrl}`);
+
+    // ----------------------------------------------------------------
+    // 4b. Start auto-checkpoint timer
+    //
+    // Writes a snapshot of { frontier, visited, errors, pagesVisited }
+    // to disk every 30s. The write itself is non-fatal; failures are
+    // swallowed by setupAutoCheckpoint's internal error handler.
+    //
+    // The getState() closure reads live data from the orchestrator's
+    // mutable state (pages[], errors[], progressSink). Since JS is
+    // single-threaded and the write is serialized through an awaited
+    // JSON.stringify, there is no partial-read race.
+    // ----------------------------------------------------------------
+    const startedAtIso = startedAt.toISOString();
+    const visitedSet: Set<string> = new Set(priorVisited ?? []);
+    const getCheckpointState = (): CheckpointState => {
+      // Rebuild the visited list from priorVisited + freshly visited URLs
+      // in this run. Deduped via a Set so a resumed URL that somehow got
+      // re-enqueued doesn't appear twice.
+      for (const p of pages) visitedSet.add(p.url);
+
+      return {
+        version: 1,
+        startedAt: startedAtIso,
+        checkpointedAt: new Date().toISOString(),
+        frontier: frontier.snapshot(),
+        visited: [...visitedSet],
+        skipped: [],
+        artifactsDir: config.outputDir,
+        pagesVisited: progressSink.pagesVisited,
+        errors,
+        configHash,
+      };
+    };
+
+    // Seed an initial checkpoint immediately so that a crash before the
+    // first 30s tick still leaves a resumable state. Non-fatal on failure.
+    try {
+      const initialState =
+        config.resume && existingCheckpoint
+          ? getCheckpointState()
+          : {
+              ...createCheckpointState({ configHash, artifactsDir: config.outputDir }),
+              frontier: frontier.snapshot(),
+              startedAt: startedAtIso,
+            };
+      await writeCheckpoint(initialState, config.outputDir);
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      logger.debug(`Initial checkpoint write failed (non-fatal): ${message}`);
+    }
+
+    autoCheckpoint = setupAutoCheckpoint(getCheckpointState, config.outputDir);
 
     // ----------------------------------------------------------------
     // 5. Run the crawl loop
@@ -281,6 +437,8 @@ export async function dig(config: ResolvedConfig): Promise<DigResult> {
       config,
       abortSignal: sigintController.signal,
       collectors: registry.size > 0 ? registry : undefined,
+      skipVisitedUrls: priorVisited,
+      progressSink,
     });
 
     pages.push(...loopResult.pages);
@@ -295,6 +453,23 @@ export async function dig(config: ResolvedConfig): Promise<DigResult> {
     let completionStatus: CrawlResult['completionStatus'] = loopResult.completionStatus;
     if (sigintController.signal.aborted) {
       completionStatus = 'interrupted';
+    }
+
+    // Stop the auto-checkpoint timer as soon as the crawl loop has
+    // returned. Subsequent work (assemble, write artifacts) is not
+    // resumable, so there is nothing to snapshot. If the crawl
+    // completed cleanly, also delete the checkpoint file so future
+    // runs start fresh; for partial/interrupted/error runs we leave
+    // it for a future --resume.
+    if (autoCheckpoint) {
+      autoCheckpoint.stop();
+      autoCheckpoint = undefined;
+    }
+    if (completionStatus === 'complete') {
+      await deleteCheckpoint(config.outputDir).catch((err: unknown) => {
+        const message = err instanceof Error ? err.message : String(err);
+        logger.debug(`Checkpoint cleanup failed (non-fatal): ${message}`);
+      });
     }
 
     // ----------------------------------------------------------------
@@ -385,6 +560,15 @@ export async function dig(config: ResolvedConfig): Promise<DigResult> {
     });
   } finally {
     process.removeListener('SIGINT', sigintHandler);
+
+    // Stop the auto-checkpoint timer if the happy path did not already
+    // clean it up (e.g., fatal error threw before completion status was
+    // evaluated). The checkpoint file itself is intentionally preserved
+    // on error/interrupt — a future --resume can pick it up.
+    if (autoCheckpoint) {
+      autoCheckpoint.stop();
+      autoCheckpoint = undefined;
+    }
 
     // Ensure browser resources are freed even on fatal error. We always
     // drain+close so HAR files flush before the merge below.

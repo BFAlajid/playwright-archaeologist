@@ -130,6 +130,9 @@ pa dig https://myapp.com --screenshot-format png
 
 # Emit pretty-printed JSON artifacts
 pa dig https://myapp.com --pretty
+
+# Resume an interrupted crawl from the last checkpoint
+pa dig https://myapp.com --resume
 ```
 
 ### Compare two snapshots
@@ -144,6 +147,31 @@ pa diff ./old-bundle ./new-bundle --format-html diff-report.html
 # Generate a JSON diff report
 pa diff ./old-bundle ./new-bundle --format-json diff-report.json
 ```
+
+### Emit Playwright tests from a crawl
+
+```bash
+# Generate a starter Playwright suite from a bundle
+pa emit-tests ./baseline/bundle -o ./generated-tests
+
+# Run the emitted specs with your own Playwright install
+npx playwright test ./generated-tests
+```
+
+The emitter writes `smoke.spec.ts` at the output root (homepage loads + every
+crawled route returns its expected status), plus per-page `forms/*.spec.ts`,
+per-flow `flows/*.spec.ts`, and per-endpoint `api/*.spec.ts` files. Every
+generated file is a **starting point** — the header comment reminds reviewers
+to tighten assertions before the suite is trusted in CI.
+
+Useful flags:
+
+| Flag | Purpose |
+|---|---|
+| `--flows-only` | Skip `smoke`, `forms`, and `api`; emit flow walks only |
+| `--forms-only` | Skip `smoke`, `flows`, and `api`; emit form submissions only |
+| `--base-url <url>` | Rewrite emitted URLs to point at a different environment (e.g. staging in CI) |
+| `--filter-by-tag <tags>` | Comma-separated URL-path fragments; only emit tests whose URLs match one |
 
 ### Authenticated crawling
 
@@ -190,6 +218,7 @@ pa dig https://myapp.com --cookies ./cookies.json
 | `--allow-private` | `false` | Bypass SSRF protection (allow private IPs, e.g. `localhost`) |
 | `--allow-auth-script` | `false` | Explicit opt-in to run user-supplied `--auth` scripts past the validator |
 | `--pretty` | `false` | Emit pretty-printed JSON artifacts (2-space indent) |
+| `--resume` | `false` | Resume from `.checkpoint.json` in the output dir (written every 30s during a crawl) |
 | `-y, --yes` | `false` | Skip confirmation prompts |
 | `-v, --verbose` | `false` | Enable debug logging |
 

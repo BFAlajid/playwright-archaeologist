@@ -64,6 +64,7 @@ export {
   CollectorError,
   DiffError,
   BundleError,
+  EmitError,
 } from './types/errors.js';
 
 // ---------------------------------------------------------------------------
@@ -81,6 +82,12 @@ export { generateReportHtml } from './report/html/template.js';
 // Bundle creation
 // ---------------------------------------------------------------------------
 export { createBundle } from './bundle/bundle-creator.js';
+
+// ---------------------------------------------------------------------------
+// Playwright test emission
+// ---------------------------------------------------------------------------
+export { emitTests } from './emit/test-emitter.js';
+export type { EmitOptions, EmittedFile } from './emit/test-emitter.js';
 
 // ---------------------------------------------------------------------------
 // Diffing

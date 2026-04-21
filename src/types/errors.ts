@@ -313,6 +313,63 @@ export class BundleError extends ArchaeologistError {
 }
 
 // ---------------------------------------------------------------------------
+// Emit errors (test-file emission from a bundle)
+// ---------------------------------------------------------------------------
+
+export type EmitErrorReason =
+  | 'bundle_not_found'
+  | 'bundle_malformed'
+  | 'output_dir_not_writable'
+  | 'write_failed';
+
+/**
+ * Thrown when `emitTests` cannot read the source bundle or write the
+ * generated Playwright specs. Callers receive a machine-readable `reason`
+ * so scripts can distinguish a missing bundle from a broken output dir.
+ */
+export class EmitError extends ArchaeologistError {
+  readonly reason: EmitErrorReason;
+  readonly bundlePath?: string;
+
+  constructor(reason: EmitErrorReason, message: string, bundlePath?: string, options?: ErrorOptions) {
+    super(message, 'ERR_EMIT', options);
+    this.name = 'EmitError';
+    this.reason = reason;
+    this.bundlePath = bundlePath;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Checkpoint errors (resume compatibility failures)
+// ---------------------------------------------------------------------------
+
+/**
+ * Thrown when a caller passes --resume but the on-disk checkpoint was written
+ * by a different config. Resuming across config changes would produce
+ * nonsensical results (e.g., a new --depth would be ignored for already-
+ * visited URLs), so we refuse and ask the user to either delete the
+ * checkpoint or rerun without --resume.
+ */
+export class CheckpointMismatchError extends ArchaeologistError {
+  readonly expectedHash: string;
+  readonly actualHash: string;
+  readonly checkpointPath: string;
+
+  constructor(expectedHash: string, actualHash: string, checkpointPath: string) {
+    super(
+      `Cannot resume: checkpoint at ${checkpointPath} was written with a ` +
+        `different config (expected hash ${expectedHash.slice(0, 8)}, found ${actualHash.slice(0, 8)}). ` +
+        `Delete the checkpoint file or rerun without --resume to start fresh.`,
+      'ERR_CHECKPOINT_MISMATCH',
+    );
+    this.name = 'CheckpointMismatchError';
+    this.expectedHash = expectedHash;
+    this.actualHash = actualHash;
+    this.checkpointPath = checkpointPath;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Security errors (explicit security-gate failures)
 // ---------------------------------------------------------------------------
 

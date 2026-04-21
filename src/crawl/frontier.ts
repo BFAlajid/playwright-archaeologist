@@ -125,4 +125,24 @@ export class Frontier {
   get isEmpty(): boolean {
     return this.head >= this.queue.length;
   }
+
+  /**
+   * Produce a non-destructive snapshot of the pending queue for checkpointing.
+   * Returns a shallow copy of entries that have not yet been dequeued.
+   * Safe to call at any time; does not mutate internal state.
+   */
+  snapshot(): FrontierEntry[] {
+    const out: FrontierEntry[] = [];
+    for (let i = this.head; i < this.queue.length; i++) {
+      const e = this.queue[i];
+      // Shallow clone so downstream serialization (JSON.stringify) cannot
+      // accidentally leak object identity back into the live queue.
+      out.push(
+        e.referrer === undefined
+          ? { url: e.url, depth: e.depth }
+          : { url: e.url, depth: e.depth, referrer: e.referrer },
+      );
+    }
+    return out;
+  }
 }

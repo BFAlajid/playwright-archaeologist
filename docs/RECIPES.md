@@ -126,6 +126,40 @@ until crawl time plateaus.
 
 ---
 
+## Resuming a long crawl
+
+Every `pa dig` run writes `.checkpoint.json` to the output directory every
+30 seconds while crawling. If the run is interrupted (SIGINT, crash,
+budget timeout), relaunch with `--resume` to pick up where it left off.
+
+```bash
+# First run — gets interrupted after a few hundred pages.
+pa dig https://big-site.com --depth 4 --max-pages 10000 -o ./crawl-out
+
+# Ctrl-C here. The checkpoint file captures the frontier + visited set.
+
+# Resume the crawl. Same command + --resume.
+pa dig https://big-site.com --depth 4 --max-pages 10000 -o ./crawl-out --resume
+```
+
+Resuming requires an **identical config hash**. Config fields that shape
+the crawl (targetUrl, depth, maxPages, include/exclude, viewport,
+concurrency, etc.) must match the original run. Fields that are purely
+path-local (outputDir, authScript, cookiesFile) are ignored by the hash,
+so you can rerun into a different output path without losing your
+checkpoint.
+
+If the hash mismatches, `pa` refuses to resume with a clear error — delete
+`.checkpoint.json` or rerun without `--resume` to start fresh. A fresh
+run with an existing checkpoint logs a warning but preserves the file
+(so you can recover if `--resume` was simply forgotten).
+
+On successful crawl completion the checkpoint file is deleted; on
+partial/interrupted/error completion it is preserved for the next
+`--resume`.
+
+---
+
 ## CI integration with GitHub Actions
 
 Crawl on every pull request, store the bundle as a cache-able artifact, and
@@ -170,6 +204,48 @@ test "$VIOLATIONS" -le 5
 The JSON is an array of per-page results. Each entry has `url`, `violations`,
 `passes`, and `incomplete`. The `jq` expression above counts total
 violations across all pages.
+
+---
+
+## Starter Playwright suite from a crawl
+
+Skip scripting the first cut of a Playwright suite by hand — crawl once,
+emit, review. The generated specs are intentionally conservative (no
+flaky assertions, no timing guesses), so they are safe to keep as a
+baseline while you tighten expectations over time.
+
+```bash
+# Crawl once to produce ./staging/bundle.
+pa dig https://staging.myapp.com -o ./staging
+
+# Emit a starter suite. smoke + one file per page with forms,
+# one file per connected flow cluster, one file per API group.
+pa emit-tests ./staging/bundle -o ./tests/generated
+
+# Run with your own Playwright install (the tool does not bundle one).
+npx playwright test ./tests/generated
+```
+
+Target a different environment without re-crawling by rewriting the base:
+
+```bash
+pa emit-tests ./staging/bundle -o ./tests/prod-smoke \
+  --base-url https://prod.myapp.com
+```
+
+The header in every emitted file points back to the source bundle and
+carries a `starting point — review assertions` marker. Treat the output
+as a `git add -p` checkpoint, not final code: broaden locators, tighten
+status assertions, and move shared setup into `beforeEach` as the suite
+stabilises.
+
+Narrowing by route segment (useful when only part of the app is changing):
+
+```bash
+# Only emit tests whose URL path contains "/admin" or "/billing"
+pa emit-tests ./staging/bundle -o ./tests/sensitive \
+  --filter-by-tag admin,billing
+```
 
 ---
 

@@ -23,6 +23,8 @@
 
 import { lookup } from 'node:dns/promises';
 
+import { fetchWithPinnedHost, isFirstParty, PinnedFetchError } from './pinned-fetch.js';
+
 export interface NetworkGuardOptions {
   allowPrivate?: boolean;
   /**
@@ -37,6 +39,30 @@ export interface NetworkGuardOptions {
    * instance into `isBlockedUrl` and `createNetworkGuard`.
    */
   dnsCache?: Map<string, string>;
+  /**
+   * Opt in to socket-level DNS pinning. When true AND the request URL is
+   * first-party to `entryHostname` AND the hostname is present in
+   * `dnsCache`, the route is fulfilled via {@link fetchWithPinnedHost}
+   * rather than `route.continue()`. This forces the underlying socket to
+   * connect to the IP the guard already approved, closing the TOCTOU gap
+   * between our resolver and Playwright's own connect.
+   *
+   * Cross-origin subresources (CDN assets, third-party analytics) fall
+   * through to `route.continue()` to avoid the per-request overhead of
+   * buffering through Node. Set `pinCrossOrigin: true` to pin them too.
+   *
+   * When `allowPrivate` is true, pinning is skipped entirely — the user
+   * has already opted in to the SSRF risk.
+   */
+  pinned?: boolean;
+  /** If set with `pinned`, cross-origin requests are pinned too. */
+  pinCrossOrigin?: boolean;
+  /**
+   * Entry-URL hostname used by the same-site heuristic. When `pinned` is
+   * true but `entryHostname` is missing, pinning only applies to exact
+   * hostname matches against pre-pinned entries.
+   */
+  entryHostname?: string;
 }
 
 // -------------------------------------------------------------------------
@@ -388,20 +414,22 @@ export async function isBlockedUrl(
 /**
  * Create a Playwright route handler that blocks requests to private IPs.
  *
- * Also performs best-effort DNS rebinding detection when `options.dnsCache`
- * is provided. Each request re-resolves the hostname and compares against
- * the pinned address set on first resolution. If none of the fresh
- * addresses match the pinned one AND at least one fresh address is private,
- * the request is blocked (classic rebinding to a private target). If all
- * fresh addresses are public but different, this is more likely ordinary
- * DNS rotation (round-robin, A/AAAA load balancing) — the request is
- * allowed but we record the observation.
+ * Also performs DNS rebinding detection when `options.dnsCache` is provided.
+ * Each request re-resolves the hostname and compares against the pinned
+ * address set on first resolution. If none of the fresh addresses match the
+ * pinned one AND at least one fresh address is private, the request is
+ * blocked (classic rebinding to a private target). If all fresh addresses
+ * are public but different, this is more likely ordinary DNS rotation
+ * (round-robin, A/AAAA load balancing) — the request is allowed but we
+ * record the observation.
  *
- * CAVEAT: this check does not cover the time-of-check-to-time-of-use window
- * between our resolver and Playwright's own TCP connect; for a hard
- * guarantee you would need to pin at the socket level (e.g. a custom HTTP
- * agent that forces connection to the pinned address with the original
- * hostname in the Host header). That is out of scope here.
+ * When `options.pinned` is true, first-party requests (same registrable
+ * domain as `entryHostname`) are fulfilled via a custom Node Agent that
+ * connects directly to the pinned IP. This closes the TOCTOU window
+ * between our resolver and Playwright's own TCP connect — attackers that
+ * flip DNS between those two lookups no longer reach the browser.
+ * Cross-origin subresources still continue through the OS resolver unless
+ * `pinCrossOrigin` is also set.
  */
 export function createNetworkGuard(options?: NetworkGuardOptions) {
   return async (route: any) => {
@@ -413,17 +441,18 @@ export function createNetworkGuard(options?: NetworkGuardOptions) {
       return;
     }
 
+    let pinnedIp: string | undefined;
     if (options?.dnsCache) {
       try {
         const hostname = new URL(url).hostname.replace(/^\[|\]$/g, '');
-        const pinned = options.dnsCache.get(hostname);
-        if (pinned) {
+        pinnedIp = options.dnsCache.get(hostname);
+        if (pinnedIp) {
           const fresh = await lookup(hostname, { all: true });
           const addresses = Array.isArray(fresh) ? fresh : [fresh];
           const freshAddrs = addresses.map((a) =>
             typeof a === 'string' ? a : a.address,
           );
-          const matches = freshAddrs.includes(pinned);
+          const matches = freshAddrs.includes(pinnedIp);
           if (!matches) {
             const anyPrivate = freshAddrs.some((a) => isPrivateIp(a));
             if (anyPrivate && !(options.allowPrivate ?? false)) {
@@ -441,6 +470,131 @@ export function createNetworkGuard(options?: NetworkGuardOptions) {
       }
     }
 
+    // Socket-level pinning: bypass Playwright's connect and fulfill the
+    // request from our own HTTP agent pointed at the pinned IP. Only does
+    // anything when (a) the caller opted in, (b) allowPrivate is off, and
+    // (c) we actually have a pinned IP for this hostname.
+    if (
+      options?.pinned &&
+      !(options.allowPrivate ?? false) &&
+      pinnedIp &&
+      shouldPinRequest(url, options)
+    ) {
+      try {
+        await fulfillPinned(route, url, pinnedIp, options);
+        return;
+      } catch (err) {
+        // If pinning fails for any reason (HTTP/2-only server, WebSocket
+        // upgrade, body-size cap, timeout), we cannot safely fall back to
+        // `route.continue()` — that would reopen the TOCTOU window the
+        // user opted in to closing. Abort the request instead.
+        if (err instanceof PinnedFetchError) {
+          await route.abort('blockedbyclient');
+          return;
+        }
+        await route.abort('blockedbyclient');
+        return;
+      }
+    }
+
     await route.continue();
   };
+}
+
+// ---------------------------------------------------------------------------
+// Pin-decision + fulfillment helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Skip pinning for requests whose characteristics we know the pinned-fetch
+ * module cannot faithfully serve. Concretely: non-GET methods that Playwright
+ * routes may still expect to go through Chromium's own network stack (e.g.
+ * navigations with complex upload streams), and WebSocket upgrades.
+ *
+ * For the initial version we pin GET and HEAD only for first-party
+ * navigations and subresources. Other methods continue through the OS
+ * resolver. Rationale: the rebinding class attack we are closing is about
+ * flipping DNS between our lookup and the browser's connect for the initial
+ * HTML/JS fetch; the moment we pin that, the page that follows cannot be
+ * attacker-controlled unless the pinned origin itself is attacker-controlled
+ * (which is a different threat model).
+ */
+function shouldPinRequest(url: string, options: NetworkGuardOptions): boolean {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return false;
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return false;
+
+  const entry = options.entryHostname;
+  if (entry && !options.pinCrossOrigin) {
+    if (!isFirstParty(parsed.hostname.replace(/^\[|\]$/g, ''), entry)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * Fulfill a Playwright route using the pinned-fetch module. Buffers the
+ * response, filters hop-by-hop headers, then calls `route.fulfill`.
+ */
+async function fulfillPinned(
+  route: any,
+  url: string,
+  pinnedIp: string,
+  options: NetworkGuardOptions,
+): Promise<void> {
+  const request = route.request();
+  const method: string = request.method();
+
+  // Only GET and HEAD are served via pinning in this release. Everything
+  // else falls through to continue() at the caller.
+  if (method !== 'GET' && method !== 'HEAD') {
+    await route.continue();
+    return;
+  }
+
+  const headers: Record<string, string> = {};
+  const playwrightHeaders = request.headers();
+  for (const [k, v] of Object.entries(playwrightHeaders)) {
+    if (typeof v === 'string') headers[k] = v;
+  }
+  // Drop browser-specific and hop-by-hop headers that Node re-adds itself.
+  delete headers['host'];
+  delete headers['content-length'];
+  delete headers['connection'];
+
+  // GET/HEAD have no request body. When we extend pinning to other methods
+  // we'll wire `request.postDataBuffer()` here.
+  const res = await fetchWithPinnedHost(method, url, pinnedIp, headers, null, {
+    allowPrivate: options.allowPrivate ?? false,
+    dnsCache: options.dnsCache,
+  });
+
+  // Normalize headers for Playwright: it accepts `Record<string, string>`.
+  // Pass `content-encoding` through untouched — Node's http.request returns
+  // the raw (compressed) body in `res.body`, and the browser will decompress
+  // it itself based on the header we forward. Strip only hop-by-hop and
+  // framing headers that do not apply to the fulfilled response.
+  const outHeaders: Record<string, string> = {};
+  for (const [k, v] of Object.entries(res.headers)) {
+    const lower = k.toLowerCase();
+    if (lower === 'transfer-encoding') continue; // body is already a buffer
+    if (lower === 'connection') continue;
+    if (lower === 'keep-alive') continue;
+    if (Array.isArray(v)) {
+      outHeaders[k] = v.join(', ');
+    } else if (typeof v === 'string') {
+      outHeaders[k] = v;
+    }
+  }
+
+  await route.fulfill({
+    status: res.status,
+    headers: outHeaders,
+    body: res.body,
+  });
 }

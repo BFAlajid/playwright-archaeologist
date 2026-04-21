@@ -39,6 +39,7 @@ function mkConfig(overrides: Partial<ResolvedConfig> = {}): ResolvedConfig {
     allowPrivate: true,
     allowAuthScript: false,
     captureJsBodies: false,
+    socketPinning: true,
     harIncludeBodies: false,
     prettyJson: false,
     includeCookies: false,

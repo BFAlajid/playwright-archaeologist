@@ -273,6 +273,20 @@ export const CrawlConfigSchema = z.object({
    * raw JS bundles frequently contain hardcoded API keys and tokens.
    */
   captureJsBodies: z.boolean().default(false),
+
+  /**
+   * Socket-level DNS pinning — force outbound TCP/TLS connections to land
+   * at the IP the network guard already validated, closing the TOCTOU
+   * window between our resolver and Playwright's own connect.
+   *
+   * Applies only to first-party GET/HEAD requests (same registrable domain
+   * as the entry URL). Cross-origin subresources and non-idempotent methods
+   * fall through to the OS resolver. Disabled automatically when
+   * `allowPrivate` is true, since the user has already accepted that risk.
+   *
+   * Default true. Use `--no-socket-pinning` to opt out.
+   */
+  socketPinning: z.boolean().default(true),
 });
 
 export type CrawlConfig = z.infer<typeof CrawlConfigSchema>;

@@ -58,6 +58,7 @@ function makeConfig(overrides: Partial<ResolvedConfig> = {}): ResolvedConfig {
     allowPrivate: true, // Allow private IPs in tests
     allowAuthScript: false,
     captureJsBodies: false,
+    socketPinning: true,
     harIncludeBodies: false,
     prettyJson: false,
     includeCookies: false,

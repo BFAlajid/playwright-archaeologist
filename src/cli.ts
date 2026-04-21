@@ -17,12 +17,20 @@ import {
   parseViewport,
 } from './types/config.js';
 import type { ResolvedConfig, Viewport } from './types/config.js';
-import { ConfigError, AuthError, ArchaeologistError, DiffError } from './types/errors.js';
+import {
+  ConfigError,
+  AuthError,
+  ArchaeologistError,
+  DiffError,
+  EmitError,
+  CheckpointMismatchError,
+} from './types/errors.js';
 import { logger } from './utils/logger.js';
 import { dig } from './crawl/orchestrator.js';
 import { diffBundles } from './diff/diff-engine.js';
 import { generateDiffReportHtml } from './diff/diff-report.js';
 import { createBundle } from './bundle/bundle-creator.js';
+import { emitTests } from './emit/test-emitter.js';
 import { AxeCollector } from './plugins/axe-collector.js';
 import type { Collector } from './plugins/types.js';
 
@@ -134,9 +142,7 @@ program
   .option('--viewports <list>', 'Additional viewports for responsive screenshots (comma-separated, e.g. 375x667,768x1024)')
 
   // -- Resume options --
-  // TODO: restore --resume once src/crawl/checkpoint.ts is wired into the orchestrator.
-  // The module exists (writeCheckpoint/readCheckpoint/setupAutoCheckpoint) but is not
-  // currently invoked, so advertising the flag would be vaporware.
+  .option('--resume', 'Resume from the last checkpoint (if present)', false)
   .option('-y, --yes', 'Skip confirmation prompts', false)
 
   // -- Security options --
@@ -155,6 +161,10 @@ program
     '--capture-js-bodies',
     'Capture JavaScript response bodies in the network log (may contain hardcoded keys)',
     false,
+  )
+  .option(
+    '--no-socket-pinning',
+    'Disable socket-level DNS pinning (revert to OS resolver; reopens a small TOCTOU window)',
   )
 
   // -- Accessibility --
@@ -268,10 +278,14 @@ program
       if (viewport) rawConfig.viewport = viewport;
       if (additionalViewports) rawConfig.additionalViewports = additionalViewports;
       if (opts.yes) rawConfig.yes = true;
+      if (opts.resume) rawConfig.resume = true;
       if (opts.allowPrivate) rawConfig.allowPrivate = true;
       if (opts.allowAuthScript) rawConfig.allowAuthScript = true;
       if (opts.harIncludeBodies) rawConfig.harIncludeBodies = true;
       if (opts.captureJsBodies) rawConfig.captureJsBodies = true;
+      // Commander uses --no-socket-pinning to set opts.socketPinning = false.
+      // Schema default is true, so only forward when explicitly disabled.
+      if (opts.socketPinning === false) rawConfig.socketPinning = false;
 
       // --- Validate with Zod ---
       const parseResult = CrawlConfigSchema.safeParse(rawConfig);
@@ -511,6 +525,82 @@ program
   });
 
 // ---------------------------------------------------------------------------
+// `emit-tests` command
+// ---------------------------------------------------------------------------
+
+program
+  .command('emit-tests')
+  .description('Generate Playwright .spec.ts files from a crawl bundle')
+  .argument('<bundle>', 'Path to the crawl bundle directory (or raw .archaeologist output dir)')
+  .option('-o, --output <dir>', 'Output directory for generated specs', './generated-tests')
+  .option('--flows-only', 'Only emit flow tests; skip forms and API tests', false)
+  .option('--forms-only', 'Only emit form tests; skip flows and API tests', false)
+  .option('--base-url <url>', 'Rewrite emitted URLs to this base (useful for CI against staging)')
+  .option('--filter-by-tag <tags>', 'Comma-separated path fragments; only emit tests whose URL matches one')
+  .option('-v, --verbose', 'Enable debug logging', false)
+  .action(async (bundle: string, opts: Record<string, unknown>) => {
+    if (opts.verbose) {
+      logger.setLevel('debug');
+    }
+
+    try {
+      const bundleDir = resolve(bundle);
+      const outputDir = resolve(typeof opts.output === 'string' ? opts.output : './generated-tests');
+
+      if (opts.flowsOnly && opts.formsOnly) {
+        throw new ConfigError(
+          'flowsOnly',
+          '--flows-only and --forms-only are mutually exclusive.',
+          { flowsOnly: true, formsOnly: true },
+        );
+      }
+
+      let filterByTag: string[] | undefined;
+      if (typeof opts.filterByTag === 'string') {
+        filterByTag = opts.filterByTag
+          .split(',')
+          .map((s) => s.trim())
+          .filter(Boolean);
+      }
+
+      let baseUrl: string | undefined;
+      if (typeof opts.baseUrl === 'string' && opts.baseUrl.length > 0) {
+        try {
+          // Validate — but keep the user-supplied string as-is so trailing
+          // slashes survive.
+          new URL(opts.baseUrl);
+          baseUrl = opts.baseUrl;
+        } catch {
+          throw new ConfigError('baseUrl', `Invalid --base-url: ${opts.baseUrl}`, opts.baseUrl);
+        }
+      }
+
+      logger.info(`Emitting Playwright tests from ${bundleDir} -> ${outputDir}`);
+
+      const emitted = await emitTests({
+        bundleDir,
+        outputDir,
+        flowsOnly: Boolean(opts.flowsOnly),
+        formsOnly: Boolean(opts.formsOnly),
+        baseUrl,
+        filterByTag,
+      });
+
+      const bytesTotal = emitted.reduce((sum, f) => sum + f.bytes, 0);
+      logger.success(
+        `Emitted ${emitted.length} spec file(s), ${bytesTotal} bytes. Run with: npx playwright test ${outputDir}`,
+      );
+      if (emitted.length === 0) {
+        logger.warn('No specs were emitted — the bundle has no routes matching your filters.');
+      }
+
+      process.exit(0);
+    } catch (err) {
+      handleError(err);
+    }
+  });
+
+// ---------------------------------------------------------------------------
 // Error handler
 // ---------------------------------------------------------------------------
 
@@ -528,6 +618,16 @@ function handleError(err: unknown): never {
   if (err instanceof DiffError) {
     logger.error(`Diff error: ${err.message}`);
     process.exit(2);
+  }
+
+  if (err instanceof EmitError) {
+    logger.error(`Emit error: ${err.message}`);
+    process.exit(2);
+  }
+
+  if (err instanceof CheckpointMismatchError) {
+    logger.error(err.message);
+    process.exit(1);
   }
 
   if (err instanceof ArchaeologistError) {

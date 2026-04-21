@@ -48,6 +48,22 @@ export interface CrawlLoopInput {
   collectors?: CollectorRegistry;
   /** Called once per completed page (includes errored/blocked pages). */
   onPageComplete?: (result: PageVisitResult) => void;
+  /**
+   * Optional: URLs already visited in a previous (interrupted) run. These
+   * URLs are NOT re-visited. Used by checkpoint resume to skip completed
+   * pages. The loop uses final-URL matching after normalization by the
+   * caller — callers should pre-normalize before populating.
+   */
+  skipVisitedUrls?: ReadonlySet<string>;
+  /**
+   * Optional: shared counters the caller can observe during the crawl.
+   * When provided, the loop updates:
+   *   - `pagesVisited`: incremented once per successfully completed visit
+   *
+   * Used by checkpoint auto-writer to snapshot live progress without
+   * racing with the loop. Mutated in place.
+   */
+  progressSink?: { pagesVisited: number };
 }
 
 export interface CrawlLoopOutput {
@@ -66,7 +82,16 @@ export interface CrawlLoopOutput {
  * drawing from the shared frontier and context pool.
  */
 export async function runCrawlLoop(input: CrawlLoopInput): Promise<CrawlLoopOutput> {
-  const { frontier, pool, config, abortSignal, collectors, onPageComplete } = input;
+  const {
+    frontier,
+    pool,
+    config,
+    abortSignal,
+    collectors,
+    onPageComplete,
+    skipVisitedUrls,
+    progressSink,
+  } = input;
 
   const pages: PageVisitResult[] = [];
   const errors: CrawlErrorEntry[] = [];
@@ -92,6 +117,13 @@ export async function runCrawlLoop(input: CrawlLoopInput): Promise<CrawlLoopOutp
 
       if (budgetFlag.tripped || interrupted) {
         return null;
+      }
+
+      // Skip URLs already visited in a prior run (checkpoint resume).
+      // These were already processed and written to disk — re-visiting
+      // would double-count pages and clobber artifacts.
+      if (skipVisitedUrls && skipVisitedUrls.has(entry.url)) {
+        continue;
       }
 
       // Enforce page/time budget on the dequeue side so we don't start
@@ -168,6 +200,7 @@ export async function runCrawlLoop(input: CrawlLoopInput): Promise<CrawlLoopOutp
 
           pages.push(pageVisit);
           visitedCount++;
+          if (progressSink) progressSink.pagesVisited = visitedCount;
           onPageComplete?.(pageVisit);
 
           if (navigationError) errors.push(navigationError);

@@ -247,4 +247,59 @@ describe.skipIf(!hasChromium)('CLI — real crawl against fixture', () => {
     const sitemap = JSON.parse(await readFile(sitemapPath, 'utf-8'));
     expect(Array.isArray(sitemap)).toBe(true);
   });
+
+  it('pa dig --resume against a pre-seeded checkpoint prints a resumption message', async () => {
+    // Seed a checkpoint file manually. Use the same config hash the real
+    // run will compute — since hashing ignores outputDir, we can build a
+    // matching config in-process.
+    const { hashConfig } = await import('../../src/crawl/config-hash.js');
+    const { writeCheckpoint } = await import('../../src/crawl/checkpoint.js');
+    const { resolveConfig } = await import('../../src/types/config.js');
+
+    const resolved = resolveConfig({
+      targetUrl: app.url,
+      depth: 0,
+      maxPages: 1,
+      allowPrivate: true,
+      noScreenshots: true,
+      noHar: true,
+      outputDir: tmpDir,
+    });
+    const expectedHash = hashConfig(resolved);
+
+    await writeCheckpoint(
+      {
+        version: 1,
+        startedAt: new Date().toISOString(),
+        checkpointedAt: new Date().toISOString(),
+        frontier: [{ url: app.url, depth: 0 }],
+        visited: [],
+        skipped: [],
+        artifactsDir: tmpDir,
+        pagesVisited: 0,
+        errors: [],
+        configHash: expectedHash,
+      },
+      tmpDir,
+    );
+
+    const result = await runCli(
+      [
+        'dig',
+        app.url,
+        '--allow-private',
+        '--depth', '0',
+        '--max-pages', '1',
+        '--no-har',
+        '--no-screenshots',
+        '--output', tmpDir,
+        '--resume',
+      ],
+      { timeout: 60_000 },
+    );
+
+    expect(result.exitCode).toBe(0);
+    // The orchestrator logs "Resuming from checkpoint:" when hydrating.
+    expect(result.combined.toLowerCase()).toContain('resuming from checkpoint');
+  });
 });
