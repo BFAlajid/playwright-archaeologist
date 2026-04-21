@@ -1,0 +1,54 @@
+name: Bug report
+description: Report a crash, incorrect output, or other defect.
+labels: ["bug"]
+body:
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you run, and what did you see?
+      placeholder: |
+        I ran `pa dig https://example.com` and got ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect?
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: playwright-archaeologist version
+      placeholder: "0.1.1"
+    validations:
+      required: true
+  - type: input
+    id: node
+    attributes:
+      label: Node version
+      placeholder: "20.18.0"
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      placeholder: "macOS 14, Ubuntu 22.04, Windows 11"
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs or error output
+      render: shell
+  - type: checkboxes
+    id: terms
+    attributes:
+      label: Checklist
+      options:
+        - label: I have redacted any credentials from logs before pasting.
+          required: true
+        - label: I have searched existing issues for duplicates.
+          required: true

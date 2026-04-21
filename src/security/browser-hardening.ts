@@ -12,20 +12,42 @@ import type { BrowserContextOptions, LaunchOptions, Page } from 'playwright';
 export interface SecureContextOptions {
   viewport?: { width: number; height: number };
   storageState?: BrowserContextOptions['storageState'];
-  recordHar?: { path: string; content?: 'embed' | 'attach'; mode?: 'full' | 'minimal' };
+  recordHar?: { path: string; content?: 'embed' | 'attach' | 'omit'; mode?: 'full' | 'minimal' };
   userAgent?: string;
   acceptDownloads?: boolean;
 }
 
 import { createRequire } from 'node:module';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
+import { existsSync } from 'node:fs';
 const _require = createRequire(import.meta.url);
-const _pkg = _require('../../package.json') as { version: string };
-export const TOOL_VERSION = _pkg.version;
 
 /**
- * Maximum number of HTTP redirects to follow before aborting.
+ * Locate package.json robustly whether this module is loaded from its
+ * source location (`src/security/browser-hardening.ts` — two levels
+ * deep from the package root) or its bundled location
+ * (`dist/cli.js` or `dist/index.js` — one level deep).
+ *
+ * tsup collapses all source into `dist/*.js`, so `../../package.json`
+ * relative to the bundled file does not exist. Fall back to
+ * `../package.json` when the two-up lookup fails.
  */
-export const MAX_REDIRECTS = 10;
+function locatePackageJson(): string {
+  const here = dirname(fileURLToPath(import.meta.url));
+  const candidates = [
+    join(here, '..', '..', 'package.json'),
+    join(here, '..', 'package.json'),
+  ];
+  for (const candidate of candidates) {
+    if (existsSync(candidate)) return candidate;
+  }
+  // Let the caller see a clear error — a missing package.json is a packaging bug.
+  return candidates[0];
+}
+
+const _pkg = _require(locatePackageJson()) as { version: string };
+export const TOOL_VERSION = _pkg.version;
 
 /**
  * Resource types that are blocked to reduce attack surface and noise.

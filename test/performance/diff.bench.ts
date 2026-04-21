@@ -10,10 +10,11 @@
  *
  * Run: npx vitest bench test/performance/diff.bench.ts
  *
- * NOTE: Some benchmarks use mock data that simulates realistic buffer sizes
- * without requiring actual PNG files or external dependencies. When the real
- * dependencies (pixelmatch, pngjs, jsondiffpatch, yazl, yauzl) are installed,
- * the commented-out sections can be enabled for accurate measurements.
+ * TODO: this bench measures an inlined fake (handwritten generators,
+ * mock RGBA buffers, commented-out pixelmatch/jsondiffpatch/yazl sections)
+ * rather than the real diff engine. Replace with real imports from
+ * src/diff/diff-engine.ts + src/bundle/bundle-creator.ts before relying
+ * on budget enforcement.
  */
 
 import { bench, describe } from 'vitest';

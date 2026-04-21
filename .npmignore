@@ -1,0 +1,5 @@
+# Source maps embed absolute local file paths and full TypeScript source.
+# Developers publishing from different machines would otherwise leak their
+# directory layout into the published tarball. Keep .map files for local
+# debugging; strip them from the tarball.
+*.map

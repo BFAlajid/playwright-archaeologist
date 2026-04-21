@@ -11,7 +11,7 @@
  * No external diff dependencies -- uses JSON comparison and SHA-256 hashes.
  */
 
-import { readFile } from 'node:fs/promises';
+import { readFile, mkdir, access } from 'node:fs/promises';
 import { join } from 'node:path';
 import type {
   BundleManifest,
@@ -31,7 +31,10 @@ import type {
   FormField,
   ApiEndpointGroup,
 } from '../types/artifacts.js';
-import { DiffError } from '../types/errors.js';
+import { BundleError, DiffError } from '../types/errors.js';
+import { isSafeBundlePath } from '../bundle/bundle-creator.js';
+import { diffScreenshotPair } from './screenshot-diff.js';
+import { createHash } from 'node:crypto';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -368,48 +371,134 @@ interface ScreenshotEntry {
   path: string;
 }
 
-function diffScreenshots(
+/** Concurrency cap for pixel diffs — pixelmatch is CPU-bound and synchronous. */
+const PIXEL_DIFF_CONCURRENCY = 8;
+
+/** Short, filesystem-safe slug derived from a URL for heatmap filenames. */
+function urlToFilenameSlug(url: string): string {
+  const hash = createHash('sha256').update(url).digest('hex').slice(0, 12);
+  return `heatmap-${hash}.png`;
+}
+
+/**
+ * Run a bounded-concurrency map. Avoids a new dependency for a 20-line helper.
+ */
+async function parallelMap<T, R>(
+  items: T[],
+  limit: number,
+  fn: (item: T, index: number) => Promise<R>,
+): Promise<R[]> {
+  const results: R[] = new Array(items.length);
+  let cursor = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (true) {
+      const index = cursor++;
+      if (index >= items.length) return;
+      results[index] = await fn(items[index], index);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
+async function diffScreenshots(
   oldScreenshots: ScreenshotEntry[],
   newScreenshots: ScreenshotEntry[],
   oldDir: string,
   newDir: string,
-): ScreenshotDiff {
+  options: { heatmapDir?: string } = {},
+): Promise<ScreenshotDiff> {
   const oldByUrl = new Map(oldScreenshots.map((s) => [s.url, s]));
   const newByUrl = new Map(newScreenshots.map((s) => [s.url, s]));
 
   const added: ScreenshotDiff['added'] = [];
   const removed: ScreenshotDiff['removed'] = [];
-  const changed: ScreenshotChange[] = [];
   let unchangedCount = 0;
 
+  // Pair up the screenshots that appear in BOTH bundles and differ by hash.
+  // Hash equality still short-circuits the expensive pixel diff.
+  const candidatePairs: Array<{ url: string; oldSs: ScreenshotEntry; newSs: ScreenshotEntry }> = [];
   for (const [url, newSs] of newByUrl) {
     const oldSs = oldByUrl.get(url);
     if (!oldSs) {
       added.push({ url, screenshotPath: join(newDir, newSs.path) });
       continue;
     }
+    if (oldSs.sha256 === newSs.sha256) {
+      unchangedCount++;
+      continue;
+    }
+    candidatePairs.push({ url, oldSs, newSs });
+  }
+  for (const [url] of oldByUrl) {
+    if (!newByUrl.has(url)) removed.push({ url });
+  }
 
-    if (oldSs.sha256 !== newSs.sha256) {
-      // Hash-based: report 100% diff if hashes differ (no pixel-level analysis)
-      changed.push({
+  // Ensure heatmap dir exists once (rather than on each pair).
+  if (options.heatmapDir) {
+    try {
+      await mkdir(options.heatmapDir, { recursive: true });
+    } catch {
+      // If the heatmap dir can't be created we still run the diff — we just
+      // won't emit heatmaps.
+    }
+  }
+
+  const changed = await parallelMap(candidatePairs, PIXEL_DIFF_CONCURRENCY, async ({ url, oldSs, newSs }): Promise<ScreenshotChange> => {
+    const oldPath = join(oldDir, oldSs.path);
+    const newPath = join(newDir, newSs.path);
+
+    // If either file is missing, fall back to hash-only reporting.
+    try {
+      await Promise.all([access(oldPath), access(newPath)]);
+    } catch {
+      return {
         url,
         diffPercentage: 100,
-        diffPixelCount: 0, // unknown without pixel analysis
-        totalPixels: 0,    // unknown without pixel analysis
-        diffImagePath: '',  // no diff image generated in hash-only mode
-        oldScreenshotPath: join(oldDir, oldSs.path),
-        newScreenshotPath: join(newDir, newSs.path),
-      });
-    } else {
-      unchangedCount++;
+        diffPixelCount: 0,
+        totalPixels: 0,
+        diffImagePath: '',
+        oldScreenshotPath: oldPath,
+        newScreenshotPath: newPath,
+        diffUnavailableReason: 'One or both screenshot files are missing on disk',
+      };
     }
-  }
 
-  for (const [url] of oldByUrl) {
-    if (!newByUrl.has(url)) {
-      removed.push({ url });
+    const heatmapPath = options.heatmapDir
+      ? join(options.heatmapDir, urlToFilenameSlug(url))
+      : undefined;
+
+    const result = await diffScreenshotPair(oldPath, newPath, {
+      emitHeatmapTo: heatmapPath,
+    });
+
+    // NaN percentage means the diff could not run (dimension mismatch,
+    // non-PNG input, etc.). Fall back to the legacy "hash changed => 100%"
+    // signal so the report still surfaces the change.
+    if (!Number.isFinite(result.percentage)) {
+      return {
+        url,
+        diffPercentage: 100,
+        diffPixelCount: 0,
+        totalPixels: 0,
+        diffImagePath: '',
+        oldScreenshotPath: oldPath,
+        newScreenshotPath: newPath,
+        diffUnavailableReason: result.mismatchReason,
+      };
     }
-  }
+
+    return {
+      url,
+      diffPercentage: Math.round(result.percentage * 100) / 100,
+      diffPixelCount: result.differentPixels,
+      totalPixels: result.totalPixels,
+      diffImagePath: result.heatmapPath ?? '',
+      heatmapPath: result.heatmapPath,
+      oldScreenshotPath: oldPath,
+      newScreenshotPath: newPath,
+    };
+  });
 
   return { added, removed, changed, unchangedCount };
 }
@@ -421,6 +510,12 @@ function diffScreenshots(
 /**
  * Extract screenshot entries from bundle manifest and screenshot-manifest.json.
  * Falls back to manifest file entries if screenshot-manifest.json is not available.
+ *
+ * Every `path` emitted here is validated against `bundleDir` via
+ * `isSafeBundlePath`. A malicious bundle that lists
+ * `../../etc/passwd` or `/etc/passwd` is rejected with a BundleError —
+ * otherwise the downstream screenshot diff would read and hash arbitrary
+ * files on the host.
  */
 async function loadScreenshotEntries(
   bundleDir: string,
@@ -432,21 +527,39 @@ async function loadScreenshotEntries(
   >(join(bundleDir, 'data', 'screenshot-manifest.json'));
 
   if (screenshotManifest && Array.isArray(screenshotManifest)) {
-    return screenshotManifest.map((s) => ({
-      url: s.url,
-      sha256: s.fullPageHash,
-      path: s.fullPagePath,
-    }));
+    return screenshotManifest.map((s) => {
+      if (!isSafeBundlePath(s.fullPagePath, bundleDir)) {
+        throw new BundleError(
+          'integrity_check_failed',
+          `Unsafe screenshot path in screenshot-manifest.json: ${s.fullPagePath}`,
+          bundleDir,
+        );
+      }
+      return {
+        url: s.url,
+        sha256: s.fullPageHash,
+        path: s.fullPagePath,
+      };
+    });
   }
 
   // Fallback: use manifest file entries for screenshots (URL unknown, use path)
   return manifest.files
     .filter((f) => f.type === 'screenshot')
-    .map((f) => ({
-      url: f.path, // best available identifier
-      sha256: f.sha256,
-      path: f.path,
-    }));
+    .map((f) => {
+      if (!isSafeBundlePath(f.path, bundleDir)) {
+        throw new BundleError(
+          'integrity_check_failed',
+          `Unsafe file path in bundle manifest: ${f.path}`,
+          bundleDir,
+        );
+      }
+      return {
+        url: f.path, // best available identifier
+        sha256: f.sha256,
+        path: f.path,
+      };
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -454,15 +567,36 @@ async function loadScreenshotEntries(
 // ---------------------------------------------------------------------------
 
 /**
+ * Options that influence how diffs are computed.
+ * These used to live on CrawlConfigSchema; they belong to the diff pipeline only.
+ */
+export interface DiffBundlesOptions {
+  /** Pixel diff threshold (0-1 scale, lower = more sensitive). Reserved for future pixel diffing. */
+  diffThreshold?: number;
+  /** Maximum diff ratio (0-100%) before a screenshot is marked changed. Reserved for future pixel diffing. */
+  diffMaxRatio?: number;
+  /** Fields to ignore during API diff. Reserved for future detailed-mode value comparisons. */
+  diffIgnoreFields?: string[];
+  /**
+   * Directory the diff engine writes pixel-diff heatmaps to. Created
+   * on demand. When omitted, pixel diffs still run but no heatmap PNG
+   * is emitted.
+   */
+  heatmapDir?: string;
+}
+
+/**
  * Compare two bundle directories and produce a DiffResult.
  *
  * @param oldDir - Path to the older bundle directory
  * @param newDir - Path to the newer bundle directory
+ * @param options - Optional diff tuning (currently accepted but not consumed by the hash-based diff engine)
  * @returns Structured diff result
  */
 export async function diffBundles(
   oldDir: string,
   newDir: string,
+  options?: DiffBundlesOptions,
 ): Promise<DiffResult> {
   // Load manifests
   const [oldManifest, newManifest] = await Promise.all([
@@ -496,11 +630,12 @@ export async function diffBundles(
   const sitemap = diffRoutes(oldSitemap ?? [], newSitemap ?? []);
   const forms = diffForms(oldForms ?? [], newForms ?? []);
   const api = diffApi(oldApiMap ?? [], newApiMap ?? []);
-  const screenshots = diffScreenshots(
+  const screenshots = await diffScreenshots(
     oldScreenshotEntries,
     newScreenshotEntries,
     oldDir,
     newDir,
+    { heatmapDir: options?.heatmapDir },
   );
 
   // Build summary

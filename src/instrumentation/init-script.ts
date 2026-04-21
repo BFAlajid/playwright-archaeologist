@@ -1,106 +1,24 @@
 /**
- * Browser instrumentation for playwright-archaeologist.
+ * Browser instrumentation init script.
  *
- * This module provides:
- * - getInitScript() — Returns JavaScript to inject via context.addInitScript().
- *   Runs in the BROWSER context (plain JS, no TypeScript, no Node.js APIs).
- * - setupPageInstrumentation() — Configures a Playwright Page for crawling.
- * - setupContextInstrumentation() — Configures a BrowserContext for crawling.
- * - NavigationCollector — Collects navigation events reported from the browser.
+ * The orchestrator injects a smaller DOM-stability-only init script inline;
+ * this module provides the richer `getInitScript()` builder that captures
+ * Navigation API events, History API mutations, popstate/hashchange, and
+ * MutationObserver-based stability. Keep this module around even while the
+ * orchestrator uses the inline version — tests and future wiring depend on
+ * the full script.
  *
- * Navigation interception strategy:
- *   PRIMARY: Navigation API (window.navigation) — Chromium 102+, catches ALL navigation types.
- *   FALLBACK: History API monkey-patching (pushState/replaceState).
- *   SUPPLEMENTARY: popstate + hashchange event listeners.
- *
- * DOM stability detection:
- *   MutationObserver tracks meaningful DOM changes. The __pa_isDomStable()
- *   function returns true when no meaningful mutations have occurred for 500ms.
- *
- * Critical ordering requirement:
- *   exposeFunction('__pa_reportNavigation') MUST be called BEFORE addInitScript,
- *   because the init script references window.__pa_reportNavigation which is
- *   created by exposeFunction. If the page loads before exposeFunction completes,
- *   the callback will be undefined.
+ * Runs in the BROWSER context — plain JS, no TypeScript, no Node.js APIs.
  */
 
-import type { Page, BrowserContext } from 'playwright';
-import { logger } from '../utils/logger.js';
-
 // ---------------------------------------------------------------------------
-// Navigation event shape (passed from browser to Node.js)
+// Navigation event shape (passed from browser to Node.js when exposed)
 // ---------------------------------------------------------------------------
 
 export interface NavigationEvent {
   url: string;
   type: 'navigation-api' | 'pushState' | 'replaceState' | 'popstate' | 'hashchange';
   timestamp: number;
-}
-
-// ---------------------------------------------------------------------------
-// NavigationCollector
-// ---------------------------------------------------------------------------
-
-/**
- * Collects navigation events reported from the browser via exposeFunction.
- * Thread-safe in the Node.js sense — all calls are on the same event loop.
- */
-export class NavigationCollector {
-  private urls: string[] = [];
-  private seen: Set<string> = new Set();
-
-  /**
-   * Handler function to pass to exposeFunction. Receives navigation events
-   * from the browser init script and stores unique URLs.
-   */
-  readonly handler = (event: NavigationEvent): void => {
-    if (!event || typeof event.url !== 'string') return;
-
-    // Validate the URL before storing
-    let normalized: string;
-    try {
-      normalized = new URL(event.url).href;
-    } catch {
-      logger.debug(`Ignoring malformed navigation URL: ${event.url}`);
-      return;
-    }
-
-    // Skip non-http protocols (javascript:, data:, blob:, etc.)
-    if (!normalized.startsWith('http:') && !normalized.startsWith('https:')) {
-      return;
-    }
-
-    if (!this.seen.has(normalized)) {
-      this.seen.add(normalized);
-      this.urls.push(normalized);
-      logger.debug(`Navigation detected [${event.type}]: ${normalized}`);
-    }
-  };
-
-  /**
-   * Returns all URLs discovered since the last call to getDiscoveredUrls()
-   * or clear(). The returned array is a snapshot — the internal buffer is
-   * drained so the same URLs are not returned twice.
-   */
-  getDiscoveredUrls(): string[] {
-    const result = this.urls.slice();
-    this.urls = [];
-    return result;
-  }
-
-  /**
-   * Returns all unique URLs seen across the lifetime of this collector,
-   * without draining the buffer.
-   */
-  getAllSeenUrls(): string[] {
-    return Array.from(this.seen);
-  }
-
-  /** Resets the collector completely — clears both the buffer and the seen set. */
-  clear(): void {
-    this.urls = [];
-    this.seen.clear();
-  }
 }
 
 // ---------------------------------------------------------------------------
@@ -117,7 +35,7 @@ export class NavigationCollector {
  *
  * The script expects window.__pa_reportNavigation to already exist
  * (set up via page.exposeFunction or context.exposeBinding before this
- * script runs).
+ * script runs) when the caller wants events delivered back to Node.js.
  */
 export function getInitScript(): string {
   // The entire script is a string literal. It must be valid browser JS.
@@ -341,156 +259,4 @@ export function getInitScript(): string {
   }
 })();
 `;
-}
-
-// ---------------------------------------------------------------------------
-// Page instrumentation
-// ---------------------------------------------------------------------------
-
-/**
- * Sets up a Playwright Page for crawling with navigation interception,
- * dialog handling, and JS error logging.
- *
- * MUST be called BEFORE the page navigates to any URL, because
- * exposeFunction must be registered before the init script runs.
- *
- * @param page - The Playwright Page to instrument.
- * @param collector - NavigationCollector to receive navigation events.
- * @returns The same collector, for chaining convenience.
- */
-export async function setupPageInstrumentation(
-  page: Page,
-  collector: NavigationCollector
-): Promise<NavigationCollector> {
-  // 1. Expose the navigation reporting function BEFORE any page loads.
-  //    This creates window.__pa_reportNavigation in the browser context.
-  //    exposeFunction persists across navigations within the same page.
-  await page.exposeFunction('__pa_reportNavigation', collector.handler);
-
-  // 2. Auto-dismiss dialogs (alert, confirm, prompt, beforeunload).
-  //    Without this, the crawler will hang on any dialog.
-  page.on('dialog', async (dialog) => {
-    try {
-      await dialog.dismiss();
-    } catch {
-      // Dialog may already be closed if the page navigated away
-    }
-  });
-
-  // 3. Log JavaScript errors on the target page.
-  //    Our init script uses try/catch internally, so target site errors
-  //    should not corrupt our instrumentation. Log for debugging.
-  page.on('pageerror', (error) => {
-    logger.debug(`JS error on ${page.url()}: ${error.message}`);
-  });
-
-  return collector;
-}
-
-// ---------------------------------------------------------------------------
-// Context instrumentation
-// ---------------------------------------------------------------------------
-
-/**
- * Sets up a BrowserContext for crawling. This is the preferred entry point
- * because it applies instrumentation to ALL pages opened within the context,
- * including popups.
- *
- * The init script is registered via context.addInitScript() so it runs
- * on every new document (including soft navigations that create new documents).
- *
- * @param context - The Playwright BrowserContext to instrument.
- * @returns A NavigationCollector that accumulates discovered URLs.
- */
-export async function setupContextInstrumentation(
-  context: BrowserContext
-): Promise<NavigationCollector> {
-  const collector = new NavigationCollector();
-
-  // 1. Register the init script on the context.
-  //    This runs on every new document BEFORE any page scripts execute.
-  //    Note: addInitScript does NOT depend on exposeFunction ordering at the
-  //    context level — it just registers the script text. The script itself
-  //    checks for window.__pa_reportNavigation existence defensively.
-  await context.addInitScript(getInitScript());
-
-  // 2. Handle popup pages (window.open, target="_blank", etc.).
-  //    Record the popup URL into the collector before closing it.
-  //    This ensures we discover URLs from popups without letting them
-  //    consume browser resources.
-  context.on('page', async (popup) => {
-    try {
-      const url = popup.url();
-
-      // Popups often start at 'about:blank' and then navigate.
-      // Wait briefly for the actual URL to resolve.
-      if (!url || url === 'about:blank') {
-        try {
-          await popup.waitForURL(/^https?:\/\//, { timeout: 3000 });
-        } catch {
-          // Popup never navigated to a real URL — skip it
-        }
-      }
-
-      const finalUrl = popup.url();
-      if (finalUrl && finalUrl !== 'about:blank') {
-        collector.handler({
-          url: finalUrl,
-          type: 'navigation-api', // Treat popup URLs as navigation events
-          timestamp: Date.now(),
-        });
-        logger.debug(`Captured popup URL: ${finalUrl}`);
-      }
-
-      await popup.close();
-    } catch {
-      // Popup may have already closed itself
-      try {
-        await popup.close();
-      } catch {
-        // Already closed
-      }
-    }
-  });
-
-  return collector;
-}
-
-// ---------------------------------------------------------------------------
-// Page-level context instrumentation helper
-// ---------------------------------------------------------------------------
-
-/**
- * Instruments an individual page within an already-instrumented context.
- * Use this when the context was set up via setupContextInstrumentation()
- * and you need to add page-level handlers (dialog, pageerror) plus
- * the exposeFunction binding.
- *
- * The init script is already registered on the context, so we only need
- * to expose the navigation function and add event handlers.
- *
- * @param page - The page to instrument.
- * @param collector - The NavigationCollector from setupContextInstrumentation().
- */
-export async function instrumentPage(
-  page: Page,
-  collector: NavigationCollector
-): Promise<void> {
-  // Expose the bridge function so the init script can report navigation events.
-  // This must happen before the page navigates.
-  await page.exposeFunction('__pa_reportNavigation', collector.handler);
-
-  // Dialog dismissal
-  page.on('dialog', async (dialog) => {
-    try {
-      await dialog.dismiss();
-    } catch {
-      // Dialog may already be closed
-    }
-  });
-
-  // JS error logging
-  page.on('pageerror', (error) => {
-    logger.debug(`JS error on ${page.url()}: ${error.message}`);
-  });
 }

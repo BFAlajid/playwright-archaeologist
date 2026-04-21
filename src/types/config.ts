@@ -26,7 +26,11 @@
  * passed to the Orchestrator and threaded through to all collectors.
  */
 
+import * as path from 'node:path';
 import { z } from 'zod';
+
+import { stripAuthInfo } from '../crawl/url-utils.js';
+import type { Collector } from '../plugins/types.js';
 
 // ---------------------------------------------------------------------------
 // Viewport
@@ -97,6 +101,14 @@ export function normalizeEntryUrl(raw: string): { url: string; warnings: string[
     if (!parsed.hostname || parsed.hostname.length === 0) {
       throw new Error('URL has no hostname.');
     }
+    // Strip embedded credentials (user:pass@) to avoid leaking them into
+    // outputs, logs, and bundles. Warn the user when this occurs.
+    if (parsed.username || parsed.password) {
+      warnings.push(
+        'Embedded credentials (user:pass@) were stripped from the URL before crawling.',
+      );
+      url = stripAuthInfo(url);
+    }
   } catch (err) {
     if (err instanceof TypeError) {
       throw new Error(`Invalid URL: ${url}`);
@@ -113,7 +125,12 @@ export function normalizeEntryUrl(raw: string): { url: string; warnings: string[
 
 export const CrawlConfigSchema = z.object({
   // ---- Target ----
-  /** Entry URL to start crawling. Must be http or https. */
+  /**
+   * Entry URL to start crawling. Must be http or https. Embedded
+   * credentials (user:pass@) are stripped by normalizeEntryUrl() before
+   * reaching this schema — any remaining auth info indicates a caller
+   * that bypassed normalization.
+   */
   targetUrl: z.string().url('Target URL must be a valid URL'),
 
   // ---- Discovery ----
@@ -201,8 +218,30 @@ export const CrawlConfigSchema = z.object({
   /** Skip screenshot capture entirely. */
   noScreenshots: z.boolean().default(false),
 
+  /**
+   * Format for full-page screenshots. Default: 'jpeg' at quality 80.
+   * JPEG is 3-5x smaller than PNG for typical screenshots; the quality
+   * loss is imperceptible for regression-diff purposes. Viewport screenshots
+   * remain PNG (small and crisp).
+   */
+  screenshotFormat: z.enum(['jpeg', 'png']).default('jpeg'),
+
   /** Skip HAR recording entirely. */
   noHar: z.boolean().default(false),
+
+  /**
+   * Pretty-print JSON artifacts (sitemap.json, forms.json, api-map.json, etc.).
+   * Default false — minified output is 30-50% smaller and eliminates a
+   * blocking pass through JSON.stringify on large crawls.
+   */
+  prettyJson: z.boolean().default(false),
+
+  /**
+   * Include response bodies in HAR output. Off by default — bodies frequently
+   * contain credentials that the scrubber cannot always detect. Opt in with
+   * --har-include-bodies when debugging response content specifically.
+   */
+  harIncludeBodies: z.boolean().default(false),
 
   // ---- Display ----
   /** Primary viewport dimensions. */
@@ -222,28 +261,18 @@ export const CrawlConfigSchema = z.object({
   /** Allow crawling private/internal IP ranges (SSRF protection bypass). */
   allowPrivate: z.boolean().default(false),
 
-  // ---- Diff (for `pa diff` subcommand) ----
-  /** Pixel diff threshold (0-1 scale, lower = more sensitive). */
-  diffThreshold: z
-    .number()
-    .min(0, 'Diff threshold must be >= 0')
-    .max(1, 'Diff threshold must be <= 1')
-    .default(0.1),
+  /**
+   * Opt in to running an auth script that fails static analysis
+   * (imports `fs`, `child_process`, uses `eval`, etc.). Without this flag,
+   * an auth script with any warnings is rejected before import.
+   */
+  allowAuthScript: z.boolean().default(false),
 
-  /** Maximum diff ratio (0-100%) before a screenshot is considered "changed". */
-  diffMaxRatio: z
-    .number()
-    .min(0, 'Diff max ratio must be >= 0')
-    .max(100, 'Diff max ratio must be <= 100')
-    .default(0.5),
-
-  /** Fields to ignore during API diff (comma-separated or array). */
-  diffIgnoreFields: z.array(z.string()).default([
-    'timestamp', 'createdAt', 'updatedAt', 'date',
-    'requestId', 'traceId', 'correlationId',
-    'token', 'nonce', 'csrf',
-    'etag', 'lastModified',
-  ]),
+  /**
+   * Capture JavaScript response bodies in the network log. Off by default —
+   * raw JS bundles frequently contain hardcoded API keys and tokens.
+   */
+  captureJsBodies: z.boolean().default(false),
 });
 
 export type CrawlConfig = z.infer<typeof CrawlConfigSchema>;
@@ -262,14 +291,27 @@ export const DiffConfigSchema = z.object({
   /** Output directory for diff report and artifacts. */
   outputDir: z.string().default('.archaeologist'),
 
-  /** Pixel diff threshold. */
-  diffThreshold: CrawlConfigSchema.shape.diffThreshold,
+  /** Pixel diff threshold (0-1 scale, lower = more sensitive). */
+  diffThreshold: z
+    .number()
+    .min(0, 'Diff threshold must be >= 0')
+    .max(1, 'Diff threshold must be <= 1')
+    .default(0.1),
 
-  /** Maximum diff ratio. */
-  diffMaxRatio: CrawlConfigSchema.shape.diffMaxRatio,
+  /** Maximum diff ratio (0-100%) before a screenshot is considered "changed". */
+  diffMaxRatio: z
+    .number()
+    .min(0, 'Diff max ratio must be >= 0')
+    .max(100, 'Diff max ratio must be <= 100')
+    .default(0.5),
 
   /** Fields to ignore during API response diff. */
-  diffIgnoreFields: CrawlConfigSchema.shape.diffIgnoreFields,
+  diffIgnoreFields: z.array(z.string()).default([
+    'timestamp', 'createdAt', 'updatedAt', 'date',
+    'requestId', 'traceId', 'correlationId',
+    'token', 'nonce', 'csrf',
+    'etag', 'lastModified',
+  ]),
 
   /** Normalize dynamic values (UUIDs, timestamps, JWTs) before diffing. */
   normalizeDynamicValues: z.boolean().default(false),
@@ -306,4 +348,57 @@ export interface ResolvedConfig extends CrawlConfig {
   cookiesFile?: string;
   /** Warnings generated during config resolution (e.g. auto-prepended https://). */
   warnings: string[];
+  /**
+   * Optional list of per-page collector plugins. Run after the built-in
+   * collectors on each visited page. Results are surfaced under
+   * `PageVisitResult.pluginData` keyed by the collector name. This is a
+   * programmatic-API-only knob; the CLI registers a vetted subset of
+   * plugins via dedicated flags (e.g. `--with-a11y`).
+   */
+  collectors?: Collector[];
+}
+
+/**
+ * Resolve a raw programmatic config into a ResolvedConfig that can be passed
+ * directly to `dig()`. This is the canonical public helper for library use:
+ *
+ *   import { dig, resolveConfig } from 'playwright-archaeologist';
+ *   const result = await dig(resolveConfig({ targetUrl: 'https://example.com' }));
+ *
+ * Steps performed:
+ *  1. Normalize the entry URL (auto-prepend https:// when protocol is missing).
+ *  2. Validate via Zod and apply defaults.
+ *  3. Resolve `outputDir`, `authScript`, `cookiesFile` to absolute paths.
+ *  4. Initialize the `warnings` array with any URL normalization warnings.
+ *
+ * Throws a standard Error if validation fails or the entry URL is invalid.
+ */
+export function resolveConfig(raw: Record<string, unknown>): ResolvedConfig {
+  const input = { ...raw };
+  let urlWarnings: string[] = [];
+
+  // Normalize target URL if provided (auto-prepend https://, reject other protocols).
+  if (typeof input.targetUrl === 'string') {
+    const { url, warnings } = normalizeEntryUrl(input.targetUrl);
+    input.targetUrl = url;
+    urlWarnings = warnings;
+  }
+
+  const parseResult = CrawlConfigSchema.safeParse(input);
+  if (!parseResult.success) {
+    const issues = parseResult.error.issues
+      .map((issue) => `${issue.path.join('.') || 'config'}: ${issue.message}`)
+      .join('; ');
+    throw new Error(`Invalid configuration: ${issues}`);
+  }
+
+  const validated = parseResult.data;
+
+  return {
+    ...validated,
+    outputDir: path.resolve(validated.outputDir),
+    authScript: validated.authScript ? path.resolve(validated.authScript) : undefined,
+    cookiesFile: validated.cookiesFile ? path.resolve(validated.cookiesFile) : undefined,
+    warnings: urlWarnings,
+  };
 }

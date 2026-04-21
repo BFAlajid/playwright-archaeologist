@@ -13,6 +13,7 @@ import { resolve } from 'node:path';
 import { readFile, writeFile, access } from 'node:fs/promises';
 import { constants } from 'node:fs';
 import { validateAuthScript } from '../security/auth-validator.js';
+import { SecurityError } from '../types/errors.js';
 
 import type { Page, BrowserContext, Cookie } from 'playwright';
 
@@ -27,6 +28,12 @@ export interface AuthOptions {
   cookiesFile?: string;
   /** Path to save/load storage state */
   storageStatePath?: string;
+  /**
+   * Opt in to running an auth script that fails static analysis. Without this
+   * flag, any script that imports `fs`, `child_process`, uses `eval`, etc.
+   * is rejected before import with a SecurityError.
+   */
+  allowAuthScript?: boolean;
 }
 
 export interface AuthResult {
@@ -207,24 +214,37 @@ async function loadCookies(
 /**
  * Validate and execute a user-provided auth script.
  * The script must export a default async function that accepts a Playwright Page.
+ *
+ * TODO: Unify with `executeAuthScript` in src/security/auth-validator.ts —
+ * both functions dynamically import a user script and run its default export.
+ * They duplicate the validation and import logic; the security module is
+ * being hardened in a parallel wave and should become the single source of
+ * truth for auth-script execution.
  */
 async function runAuthScript(
   page: Page,
   scriptPath: string,
+  allowAuthScript = false,
 ): Promise<void> {
   const resolvedPath = resolve(scriptPath);
 
-  // Validate script safety before execution
-  const validation = validateAuthScript(resolvedPath);
-  if (!validation.valid) {
-    throw new Error(
-      `Auth script failed validation: ${validation.warnings.join('; ')}`,
-    );
-  }
-
-  // Check file exists
+  // Check file exists first — validateAuthScript reads the file and will
+  // throw a less helpful error than our ENOENT message if it's missing.
   if (!(await fileExists(resolvedPath))) {
     throw new Error(`Auth script not found: ${resolvedPath}`);
+  }
+
+  // Static analysis BEFORE dynamic import. If the import runs first, any
+  // top-level side effect in a malicious script executes before we can
+  // reject it.
+  const validation = validateAuthScript(resolvedPath);
+  if (!validation.valid && !allowAuthScript) {
+    throw new SecurityError(
+      'auth_script_dangerous',
+      `Auth script '${resolvedPath}' failed static analysis:\n  - ` +
+        validation.warnings.join('\n  - ') +
+        `\nRe-run with --allow-auth-script if you trust this script.`,
+    );
   }
 
   // Dynamic import
@@ -382,7 +402,7 @@ export async function executeAuth(
   // ------ Auth Script ------
   if (options.authScript) {
     try {
-      await runAuthScript(page, options.authScript);
+      await runAuthScript(page, options.authScript, options.allowAuthScript);
 
       // Check for auth failure after script execution
       const failureCheck = await detectAuthFailure(page);

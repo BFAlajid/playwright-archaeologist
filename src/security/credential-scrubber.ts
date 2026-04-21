@@ -108,7 +108,6 @@ function isLuhnValid(digits: string): boolean {
 // AWS key patterns
 // -------------------------------------------------------------------------
 const AWS_ACCESS_KEY_RE = /\bAKIA[0-9A-Z]{16}\b/g;
-const AWS_SECRET_KEY_RE = /\b[A-Za-z0-9/+=]{40}\b/g;
 
 // -------------------------------------------------------------------------
 // JWT pattern: eyJ<base64>.<base64>.<signature>
@@ -238,7 +237,7 @@ export function maskJwt(value: string): string {
 /**
  * Scrub sensitive fields from a JSON object, recursively.
  */
-function scrubJsonObject(obj: any): any {
+export function scrubJsonObject(obj: any): any {
   if (obj === null || obj === undefined) return obj;
   if (typeof obj !== 'object') return obj;
 

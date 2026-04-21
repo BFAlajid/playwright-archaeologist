@@ -6,8 +6,8 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { generateDiffReportHtml } from '../../src/diff/diff-report.js';
-import type { DiffResult, DiffSummary } from '../../src/types/artifacts.js';
+import { generateDiffReportHtml, sortRouteChanges } from '../../src/diff/diff-report.js';
+import type { DiffResult, DiffSummary, SitemapRouteChange } from '../../src/types/artifacts.js';
 
 /** Create a minimal DiffResult for testing. */
 function makeDiffResult(overrides?: Partial<DiffResult>): DiffResult {
@@ -382,5 +382,341 @@ describe('generateDiffReportHtml', () => {
 
     expect(html).toContain('<style>');
     expect(html).toContain('font-family');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// New: chip-bar filter (Fix M)
+// ---------------------------------------------------------------------------
+
+describe('chip bar filter', () => {
+  it('renders All / Added / Removed / Changed chips', () => {
+    const html = generateDiffReportHtml(makeDiffResult());
+    expect(html).toContain('data-filter="all"');
+    expect(html).toContain('data-filter="added"');
+    expect(html).toContain('data-filter="removed"');
+    expect(html).toContain('data-filter="changed"');
+    expect(html).toContain('aria-label="Filter by change type"');
+  });
+
+  it('wraps each sub-section in data-type block', () => {
+    const html = generateDiffReportHtml(
+      makeDiffResult({
+        hasChanges: true,
+        sitemap: {
+          added: [
+            {
+              url: 'https://example.com/new',
+              title: 'New',
+              statusCode: 200,
+              contentHash: '',
+              depth: 1,
+              formCount: 0,
+              apiCallCount: 0,
+              hasScreenshot: false,
+              discoveryMethod: 'link' as const,
+            },
+          ],
+          removed: [],
+          changed: [],
+          unchangedCount: 0,
+        },
+        summary: {
+          routes: { added: 1, removed: 0, changed: 0, unchanged: 0 },
+          forms: { added: 0, removed: 0, changed: 0, unchanged: 0 },
+          api: { added: 0, removed: 0, changed: 0, unchanged: 0 },
+          screenshots: { added: 0, removed: 0, changed: 0, unchanged: 0 },
+        },
+      }),
+    );
+    expect(html).toContain('class="section-block" data-type="added"');
+  });
+
+  it('includes chip toggle JS that flips hidden on data-type blocks', () => {
+    const html = generateDiffReportHtml(makeDiffResult());
+    expect(html).toContain('.section-block[data-type]');
+    expect(html).toContain("setAttribute('hidden', '')");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// sortRouteChanges (Fix M)
+// ---------------------------------------------------------------------------
+
+describe('sortRouteChanges', () => {
+  it('sorts statusCode changes before contentHash changes', () => {
+    const input: SitemapRouteChange[] = [
+      { url: '/c', changes: { contentHash: { old: 'a', new: 'b' } } },
+      { url: '/s', changes: { statusCode: { old: 200, new: 301 } } },
+    ];
+    const out = sortRouteChanges(input);
+    expect(out[0].url).toBe('/s');
+    expect(out[1].url).toBe('/c');
+  });
+
+  it('sorts statusCode > contentHash > title-only', () => {
+    const input: SitemapRouteChange[] = [
+      { url: '/t', changes: { title: { old: 'A', new: 'B' } } },
+      { url: '/c', changes: { contentHash: { old: 'a', new: 'b' } } },
+      { url: '/s', changes: { statusCode: { old: 200, new: 404 } } },
+    ];
+    const out = sortRouteChanges(input);
+    expect(out.map(c => c.url)).toEqual(['/s', '/c', '/t']);
+  });
+
+  it('does not mutate the input array', () => {
+    const input: SitemapRouteChange[] = [
+      { url: '/c', changes: { contentHash: { old: 'a', new: 'b' } } },
+      { url: '/s', changes: { statusCode: { old: 200, new: 301 } } },
+    ];
+    const snapshot = input.map(c => c.url);
+    sortRouteChanges(input);
+    expect(input.map(c => c.url)).toEqual(snapshot);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Net delta text (Fix M)
+// ---------------------------------------------------------------------------
+
+describe('net delta subtitle', () => {
+  it('shows +A / -R / ~C with net formula per summary card', () => {
+    const html = generateDiffReportHtml(
+      makeDiffResult({
+        hasChanges: true,
+        summary: {
+          routes: { added: 3, removed: 1, changed: 2, unchanged: 10 },
+          forms: { added: 0, removed: 0, changed: 0, unchanged: 0 },
+          api: { added: 0, removed: 0, changed: 0, unchanged: 0 },
+          screenshots: { added: 0, removed: 0, changed: 0, unchanged: 0 },
+        },
+      }),
+    );
+    // +3 / -1 / ~2 → net +2
+    expect(html).toContain('+3 / -1 / ~2');
+    expect(html).toContain('net +2');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Back-links to bundle reports (Fix N)
+// ---------------------------------------------------------------------------
+
+describe('report back-links', () => {
+  it('emits back-links when reportUrl is provided', () => {
+    const html = generateDiffReportHtml(
+      makeDiffResult({
+        hasChanges: true,
+        meta: {
+          oldBundle: {
+            path: '/old',
+            createdAt: '2025-01-01',
+            targetUrl: 'https://example.com',
+            toolVersion: '0.1.0',
+            reportUrl: 'https://reports.example.com/old/report.html',
+          },
+          newBundle: {
+            path: '/new',
+            createdAt: '2025-02-01',
+            targetUrl: 'https://example.com',
+            toolVersion: '0.1.0',
+            reportUrl: 'https://reports.example.com/new/report.html',
+          },
+          comparedAt: '2025-03-01',
+        },
+        sitemap: {
+          added: [
+            {
+              url: 'https://example.com/x',
+              title: 'X',
+              statusCode: 200,
+              contentHash: '',
+              depth: 1,
+              formCount: 0,
+              apiCallCount: 0,
+              hasScreenshot: false,
+              discoveryMethod: 'link' as const,
+            },
+          ],
+          removed: [],
+          changed: [],
+          unchangedCount: 0,
+        },
+        summary: {
+          routes: { added: 1, removed: 0, changed: 0, unchanged: 0 },
+          forms: { added: 0, removed: 0, changed: 0, unchanged: 0 },
+          api: { added: 0, removed: 0, changed: 0, unchanged: 0 },
+          screenshots: { added: 0, removed: 0, changed: 0, unchanged: 0 },
+        },
+      }),
+    );
+    expect(html).toContain('class="back-link"');
+    expect(html).toContain('reports.example.com');
+  });
+
+  it('omits back-links when reportUrl is not provided', () => {
+    const html = generateDiffReportHtml(
+      makeDiffResult({
+        hasChanges: true,
+        sitemap: {
+          added: [
+            {
+              url: 'https://example.com/x',
+              title: 'X',
+              statusCode: 200,
+              contentHash: '',
+              depth: 1,
+              formCount: 0,
+              apiCallCount: 0,
+              hasScreenshot: false,
+              discoveryMethod: 'link' as const,
+            },
+          ],
+          removed: [],
+          changed: [],
+          unchangedCount: 0,
+        },
+        summary: {
+          routes: { added: 1, removed: 0, changed: 0, unchanged: 0 },
+          forms: { added: 0, removed: 0, changed: 0, unchanged: 0 },
+          api: { added: 0, removed: 0, changed: 0, unchanged: 0 },
+          screenshots: { added: 0, removed: 0, changed: 0, unchanged: 0 },
+        },
+      }),
+    );
+    expect(html).not.toContain('class="back-link"');
+  });
+
+  it('sanitises reportUrl, blocking javascript: schemes', () => {
+    const html = generateDiffReportHtml(
+      makeDiffResult({
+        hasChanges: true,
+        meta: {
+          oldBundle: {
+            path: '/old',
+            createdAt: '2025-01-01',
+            targetUrl: 'https://example.com',
+            toolVersion: '0.1.0',
+            reportUrl: 'javascript:alert(1)',
+          },
+          newBundle: {
+            path: '/new',
+            createdAt: '2025-02-01',
+            targetUrl: 'https://example.com',
+            toolVersion: '0.1.0',
+          },
+          comparedAt: '2025-03-01',
+        },
+        sitemap: {
+          added: [],
+          removed: [
+            {
+              url: 'https://example.com/gone',
+              title: 'Gone',
+              statusCode: 200,
+              contentHash: '',
+              depth: 1,
+              formCount: 0,
+              apiCallCount: 0,
+              hasScreenshot: false,
+              discoveryMethod: 'link' as const,
+            },
+          ],
+          changed: [],
+          unchangedCount: 0,
+        },
+        summary: {
+          routes: { added: 0, removed: 1, changed: 0, unchanged: 0 },
+          forms: { added: 0, removed: 0, changed: 0, unchanged: 0 },
+          api: { added: 0, removed: 0, changed: 0, unchanged: 0 },
+          screenshots: { added: 0, removed: 0, changed: 0, unchanged: 0 },
+        },
+      }),
+    );
+    expect(html).not.toContain('javascript:alert(1)');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Absolute-path redaction in meta (Fix P)
+// ---------------------------------------------------------------------------
+
+describe('diff report meta path redaction', () => {
+  it('redacts absolute bundle paths when targetUrl is empty', () => {
+    const html = generateDiffReportHtml(
+      makeDiffResult({
+        meta: {
+          oldBundle: {
+            path: 'C:\\Users\\me\\bundles\\old',
+            createdAt: '2025-01-01',
+            targetUrl: '',
+            toolVersion: '0.1.0',
+          },
+          newBundle: {
+            path: '/home/runner/new-bundle',
+            createdAt: '2025-02-01',
+            targetUrl: '',
+            toolVersion: '0.1.0',
+          },
+          comparedAt: '2025-03-01',
+        },
+      }),
+    );
+    expect(html).not.toContain('C:\\Users\\me');
+    expect(html).not.toContain('/home/runner');
+    expect(html).toContain('&lt;file&gt;');
+  });
+
+  it('preserves targetUrl when present (skips path)', () => {
+    const html = generateDiffReportHtml(
+      makeDiffResult({
+        meta: {
+          oldBundle: {
+            path: 'C:\\Users\\me\\bundles\\old',
+            createdAt: '2025-01-01',
+            targetUrl: 'https://example.com',
+            toolVersion: '0.1.0',
+          },
+          newBundle: {
+            path: '/home/runner/new-bundle',
+            createdAt: '2025-02-01',
+            targetUrl: 'https://example.com',
+            toolVersion: '0.1.0',
+          },
+          comparedAt: '2025-03-01',
+        },
+      }),
+    );
+    expect(html).not.toContain('C:\\Users\\me');
+    expect(html).not.toContain('/home/runner');
+    expect(html).toContain('https://example.com');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Theme toggle (Fix E)
+// ---------------------------------------------------------------------------
+
+describe('diff report theme toggle', () => {
+  it('renders a theme-toggle button', () => {
+    const html = generateDiffReportHtml(makeDiffResult());
+    expect(html).toContain('id="theme-toggle"');
+    expect(html).toContain('aria-label="Toggle theme"');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Favicon and meta tags
+// ---------------------------------------------------------------------------
+
+describe('diff report favicon and meta', () => {
+  it('includes an inline SVG favicon', () => {
+    const html = generateDiffReportHtml(makeDiffResult());
+    expect(html).toMatch(/<link rel="icon" type="image\/svg\+xml"/);
+  });
+
+  it('includes meta generator', () => {
+    const html = generateDiffReportHtml(makeDiffResult());
+    expect(html).toContain('<meta name="generator" content="playwright-archaeologist">');
   });
 });

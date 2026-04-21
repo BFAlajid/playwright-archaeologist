@@ -4,25 +4,68 @@
  * Tests the captureScreenshots function with mocked Playwright Page objects.
  * Verifies screenshot capture, scrolling, hashing, modal detection,
  * PNG dimension extraction, directory creation, and graceful failure.
+ *
+ * The implementation streams screenshot bytes directly to disk via
+ * Playwright's `path` option and then streams the file back through
+ * createHash — it does NOT hold the screenshot in a Node Buffer. The tests
+ * mock `node:fs` streams accordingly.
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { captureScreenshots } from '../../src/collectors/screenshot-capturer.js';
+import { captureScreenshots, parseJpegDimensions } from '../../src/collectors/screenshot-capturer.js';
 import type { Page, Locator } from 'playwright';
 import { createHash } from 'node:crypto';
-import { join, sep } from 'node:path';
+import { sep } from 'node:path';
 
 // ---------------------------------------------------------------------------
-// Mock fs/promises — intercept mkdir and stat calls
+// Mock fs/promises — intercept mkdir/stat calls
 // ---------------------------------------------------------------------------
 
 vi.mock('node:fs/promises', () => ({
   mkdir: vi.fn(async () => undefined),
-  readFile: vi.fn(async () => Buffer.alloc(0)),
   stat: vi.fn(async () => ({ size: 1024 })),
 }));
 
 import { mkdir, stat } from 'node:fs/promises';
+
+// ---------------------------------------------------------------------------
+// Mock node:fs createReadStream — return a readable stream of the buffer
+// the test wants to pretend the screenshot wrote. Controlled per-test via
+// setMockFileBuffer().
+// ---------------------------------------------------------------------------
+
+let mockFileBuffer: Buffer = Buffer.alloc(0);
+function setMockFileBuffer(buf: Buffer) {
+  mockFileBuffer = buf;
+}
+
+vi.mock('node:fs', () => ({
+  createReadStream: vi.fn((_filePath: string, opts?: { start?: number; end?: number }) => {
+    // Slice the mock buffer to match the requested byte range if any.
+    const start = opts?.start ?? 0;
+    const endInclusive = opts?.end ?? mockFileBuffer.length - 1;
+    const sliced = mockFileBuffer.slice(start, endInclusive + 1);
+
+    const handlers = new Map<string, Array<(...args: unknown[]) => void>>();
+    const stream = {
+      on(event: string, handler: (...args: unknown[]) => void) {
+        if (!handlers.has(event)) handlers.set(event, []);
+        handlers.get(event)!.push(handler);
+        // Fire asynchronously like a real stream.
+        if (event === 'end') {
+          setTimeout(() => {
+            const dataHandlers = handlers.get('data') ?? [];
+            for (const h of dataHandlers) h(sliced);
+            const endHandlers = handlers.get('end') ?? [];
+            for (const h of endHandlers) h();
+          }, 0);
+        }
+        return stream;
+      },
+    };
+    return stream;
+  }),
+}));
 
 // ---------------------------------------------------------------------------
 // Helpers: create a valid PNG buffer with specified dimensions
@@ -31,21 +74,30 @@ import { mkdir, stat } from 'node:fs/promises';
 /**
  * Build a minimal PNG-like buffer with the given dimensions encoded
  * at the correct byte offsets (16-19 for width, 20-23 for height).
- * This is not a valid PNG file, but has the correct IHDR offsets for parsing.
  */
 function makePngBuffer(width: number, height: number): Buffer {
-  // 8-byte PNG signature + 4-byte IHDR length + 4-byte IHDR type + 4-byte width + 4-byte height + padding
   const buf = Buffer.alloc(32);
-  // PNG signature (first 8 bytes)
-  buf.writeUInt32BE(0x89504E47, 0);
-  buf.writeUInt32BE(0x0D0A1A0A, 4);
-  // IHDR chunk length (13 bytes of IHDR data)
+  buf.writeUInt32BE(0x89504e47, 0);
+  buf.writeUInt32BE(0x0d0a1a0a, 4);
   buf.writeUInt32BE(13, 8);
-  // IHDR chunk type
   buf.write('IHDR', 12);
-  // Width at offset 16, height at offset 20
   buf.writeUInt32BE(width, 16);
   buf.writeUInt32BE(height, 20);
+  return buf;
+}
+
+/**
+ * Build a minimal JPEG-like buffer with dimensions encoded in an SOF0 marker.
+ */
+function makeJpegBuffer(width: number, height: number): Buffer {
+  // SOI (0xFFD8) + SOF0 (0xFFC0) + len(2) + precision(1) + height(2) + width(2) + ...
+  const buf = Buffer.alloc(32);
+  buf[0] = 0xff; buf[1] = 0xd8;           // SOI
+  buf[2] = 0xff; buf[3] = 0xc0;           // SOF0
+  buf.writeUInt16BE(11, 4);               // segment length (not validated here)
+  buf[6] = 8;                              // precision
+  buf.writeUInt16BE(height, 7);
+  buf.writeUInt16BE(width, 9);
   return buf;
 }
 
@@ -65,11 +117,9 @@ function createMockLocator(visibleElements: boolean[]): MockLocator {
     nth: vi.fn(),
     isVisible: vi.fn(),
   };
-
   locator.nth.mockImplementation((index: number) => ({
     isVisible: vi.fn(async () => visibleElements[index] ?? false),
   }));
-
   return locator;
 }
 
@@ -80,24 +130,24 @@ function createMockPage(options: {
   screenshotThrows?: boolean;
   modalElements?: boolean[];
 }): Page {
-  const pngBuffer = options.screenshotBuffer ?? makePngBuffer(1280, 2400);
-  const modalElements = options.modalElements ?? [];
-  const locator = createMockLocator(modalElements);
+  const buffer = options.screenshotBuffer ?? makeJpegBuffer(1280, 2400);
+  // Install this buffer as the data backing createReadStream for the life
+  // of this test.
+  setMockFileBuffer(buffer);
+
+  const hasVisibleModal = (options.modalElements ?? []).some(Boolean);
 
   const page = {
     url: () => options.url,
-    evaluate: vi.fn(async (fn: Function, ...args: unknown[]) => {
-      // Detect which evaluate call this is based on the function source
+    evaluate: vi.fn(async (fn: Function, _arg?: unknown) => {
       const fnStr = fn.toString();
-
-      if (fnStr.includes('scrollHeight')) {
+      // triggerLazyContent: uses viewportHeight/scrollHeight, returns scrollHeight
+      if (fnStr.includes('viewportHeight') || fnStr.includes('scrollHeight')) {
         return options.scrollHeight ?? 3000;
       }
-      if (fnStr.includes('scrollTo')) {
-        return undefined;
-      }
-      if (fnStr.includes('setTimeout')) {
-        return undefined;
+      // detectModals: uses querySelectorAll with dialog/[role="dialog"]
+      if (fnStr.includes('dialog[open]')) {
+        return hasVisibleModal;
       }
       return undefined;
     }),
@@ -105,9 +155,12 @@ function createMockPage(options: {
       if (options.screenshotThrows) {
         throw new Error('Screenshot capture failed');
       }
-      return pngBuffer;
+      // Playwright would write to disk here; our mock stream already has the
+      // bytes queued up. Return an empty buffer to confirm we are not relying
+      // on the return value anywhere.
+      return Buffer.alloc(0);
     }),
-    locator: vi.fn((_selector: string) => locator as unknown as Locator),
+    locator: vi.fn((_selector: string) => ({} as Locator)),
   } as unknown as Page;
 
   return page;
@@ -126,29 +179,37 @@ describe('captureScreenshots', () => {
   // File path generation
   // -------------------------------------------------------------------------
 
-  it('generates correct file paths from the page URL', async () => {
+  it('generates correct file paths from the page URL (default JPEG full-page)', async () => {
     const page = createMockPage({ url: 'https://example.com/about' });
     const outputDir = '/output/screenshots';
 
     const result = await captureScreenshots(page, 'https://example.com', outputDir);
 
-    // urlToFilename('https://example.com/about') produces a sanitized name
-    // The paths should be in the output directory with _full.png and _viewport.png suffixes
-    // Use platform-agnostic assertions (Windows uses backslash, Unix uses forward slash)
+    // Default format is now JPEG — full-page filename ends in .jpg.
     expect(result.fullPagePath).toContain('example.com');
-    expect(result.fullPagePath).toMatch(/_full\.png$/);
+    expect(result.fullPagePath).toMatch(/_full\.jpg$/);
+    // Viewport stays PNG.
     expect(result.viewportPath).toContain('example.com');
     expect(result.viewportPath).toMatch(/_viewport\.png$/);
-    // Both paths start with the output directory
     expect(result.fullPagePath.startsWith(outputDir.replace(/\//g, sep))).toBe(true);
     expect(result.viewportPath.startsWith(outputDir.replace(/\//g, sep))).toBe(true);
   });
 
+  it('writes PNG full-page when format=png', async () => {
+    const pngBuffer = makePngBuffer(800, 600);
+    const page = createMockPage({ url: 'https://example.com/about', screenshotBuffer: pngBuffer });
+
+    const result = await captureScreenshots(page, 'https://example.com', '/out', undefined, {
+      format: 'png',
+    });
+
+    expect(result.fullPagePath).toMatch(/_full\.png$/);
+    expect(result.viewportPath).toMatch(/_viewport\.png$/);
+  });
+
   it('uses the page URL in the result', async () => {
     const page = createMockPage({ url: 'https://example.com/dashboard' });
-
     const result = await captureScreenshots(page, 'https://example.com', '/out');
-
     expect(result.pageUrl).toBe('https://example.com/dashboard');
   });
 
@@ -164,70 +225,95 @@ describe('captureScreenshots', () => {
     const screenshotMock = page.screenshot as ReturnType<typeof vi.fn>;
     expect(screenshotMock).toHaveBeenCalledTimes(2);
 
-    // First call: full-page screenshot
+    // First call: full-page JPEG by default.
     const firstCallArgs = screenshotMock.mock.calls[0][0];
     expect(firstCallArgs.fullPage).toBe(true);
-    expect(firstCallArgs.path).toMatch(/_full\.png$/);
+    expect(firstCallArgs.path).toMatch(/_full\.jpg$/);
+    expect(firstCallArgs.type).toBe('jpeg');
+    expect(firstCallArgs.quality).toBe(80);
 
-    // Second call: viewport-only screenshot
+    // Second call: viewport-only PNG.
     const secondCallArgs = screenshotMock.mock.calls[1][0];
     expect(secondCallArgs.fullPage).toBeUndefined();
     expect(secondCallArgs.path).toMatch(/_viewport\.png$/);
+    expect(secondCallArgs.type).toBeUndefined();
+  });
+
+  it('does NOT set type/quality when format=png', async () => {
+    const pngBuffer = makePngBuffer(800, 600);
+    const page = createMockPage({ url: 'https://example.com/', screenshotBuffer: pngBuffer });
+
+    await captureScreenshots(page, 'https://example.com', '/out', undefined, { format: 'png' });
+
+    const screenshotMock = page.screenshot as ReturnType<typeof vi.fn>;
+    const firstCallArgs = screenshotMock.mock.calls[0][0];
+    expect(firstCallArgs.type).toBeUndefined();
+    expect(firstCallArgs.quality).toBeUndefined();
+    expect(firstCallArgs.path).toMatch(/_full\.png$/);
+  });
+
+  it('does not hold the screenshot buffer in memory — passes `path` only', async () => {
+    const page = createMockPage({ url: 'https://example.com/' });
+
+    await captureScreenshots(page, 'https://example.com', '/out');
+
+    const screenshotMock = page.screenshot as ReturnType<typeof vi.fn>;
+    // Every call must include a path, never omit it (which would force the
+    // buffer to stay in Node memory).
+    for (const call of screenshotMock.mock.calls) {
+      expect(call[0]).toHaveProperty('path');
+      expect(typeof (call[0] as { path: string }).path).toBe('string');
+    }
   });
 
   // -------------------------------------------------------------------------
   // Scrolling behavior
   // -------------------------------------------------------------------------
 
-  it('calls page.evaluate for scrolling to trigger lazy-loaded content', async () => {
+  it('runs lazy-content scrolling via a SINGLE page.evaluate roundtrip', async () => {
     const page = createMockPage({ url: 'https://example.com/', scrollHeight: 3000 });
 
     await captureScreenshots(page, 'https://example.com', '/out');
 
     const evaluateMock = page.evaluate as ReturnType<typeof vi.fn>;
-    // Should have been called multiple times:
-    // 1x for scrollHeight, Nx for scrollTo + settle, 1x for scroll-to-top
-    expect(evaluateMock.mock.calls.length).toBeGreaterThanOrEqual(3);
 
-    // Check that scrollTo was called (functions containing 'scrollTo')
-    const scrollCalls = evaluateMock.mock.calls.filter((call: unknown[]) =>
-      (call[0] as Function).toString().includes('scrollTo'),
-    );
-    expect(scrollCalls.length).toBeGreaterThanOrEqual(1);
-  });
-
-  it('limits scrolling to 3 viewport increments', async () => {
-    // Page is very tall but we should only scroll 3 times
-    const page = createMockPage({ url: 'https://example.com/', scrollHeight: 100_000 });
-    const viewport = { width: 1280, height: 720 };
-
-    await captureScreenshots(page, 'https://example.com', '/out', viewport);
-
-    const evaluateMock = page.evaluate as ReturnType<typeof vi.fn>;
-    // Count scrollTo calls (excluding the final scroll-to-top)
-    const scrollDownCalls = evaluateMock.mock.calls.filter((call: unknown[]) => {
+    // The scroll loop runs inside the browser. The outer page.evaluate call
+    // count for scrolling must be exactly 1 — no N+1 round-trips per step.
+    const scrollCalls = evaluateMock.mock.calls.filter((call: unknown[]) => {
       const fnStr = (call[0] as Function).toString();
-      return fnStr.includes('scrollTo') && call.length > 1 && typeof call[1] === 'number';
+      return fnStr.includes('viewportHeight') && fnStr.includes('scrollTo');
     });
-    // Should have at most 3 scroll-down calls
-    expect(scrollDownCalls.length).toBeLessThanOrEqual(3);
+    expect(scrollCalls).toHaveLength(1);
+  });
+
+  it('modal detection runs in a single evaluate — no count/nth/isVisible calls', async () => {
+    const page = createMockPage({ url: 'https://example.com/', modalElements: [true] });
+
+    await captureScreenshots(page, 'https://example.com', '/out');
+
+    // The new implementation does not use page.locator at all for detection.
+    // It uses a single page.evaluate against the selector inside the browser.
+    const evaluateMock = page.evaluate as ReturnType<typeof vi.fn>;
+    const modalEvals = evaluateMock.mock.calls.filter((call: unknown[]) =>
+      (call[0] as Function).toString().includes('dialog[open]'),
+    );
+    expect(modalEvals).toHaveLength(1);
   });
 
   // -------------------------------------------------------------------------
-  // SHA-256 hash computation
+  // SHA-256 hash computation (streaming)
   // -------------------------------------------------------------------------
 
-  it('computes correct SHA-256 hashes for both screenshots', async () => {
-    const pngBuffer = makePngBuffer(800, 600);
-    const expectedHash = createHash('sha256').update(pngBuffer).digest('hex');
+  it('computes SHA-256 hashes by streaming the file from disk', async () => {
+    const jpegBuffer = makeJpegBuffer(800, 600);
+    const expectedHash = createHash('sha256').update(jpegBuffer).digest('hex');
 
-    const page = createMockPage({
-      url: 'https://example.com/',
-      screenshotBuffer: pngBuffer,
-    });
+    const page = createMockPage({ url: 'https://example.com/', screenshotBuffer: jpegBuffer });
 
     const result = await captureScreenshots(page, 'https://example.com', '/out');
 
+    // Both full-page and viewport stream from the same mock buffer, so both
+    // hashes are identical to the buffer hash.
     expect(result.fullPageHash).toBe(expectedHash);
     expect(result.viewportHash).toBe(expectedHash);
     expect(result.fullPageHash).toHaveLength(64);
@@ -240,36 +326,30 @@ describe('captureScreenshots', () => {
   it('detects visible modals on the page', async () => {
     const page = createMockPage({
       url: 'https://example.com/',
-      modalElements: [true], // one visible modal
+      modalElements: [true],
     });
 
     const result = await captureScreenshots(page, 'https://example.com', '/out');
-
     expect(result.modalDetected).toBe(true);
-    expect(page.locator).toHaveBeenCalledWith(
-      'dialog[open], [role="dialog"], .modal.show, .modal.active',
-    );
   });
 
   it('returns modalDetected false when no modals are present', async () => {
     const page = createMockPage({
       url: 'https://example.com/',
-      modalElements: [], // no modals
+      modalElements: [],
     });
 
     const result = await captureScreenshots(page, 'https://example.com', '/out');
-
     expect(result.modalDetected).toBe(false);
   });
 
   it('returns modalDetected false when modals exist but are not visible', async () => {
     const page = createMockPage({
       url: 'https://example.com/',
-      modalElements: [false, false], // modals exist but none visible
+      modalElements: [false, false],
     });
 
     const result = await captureScreenshots(page, 'https://example.com', '/out');
-
     expect(result.modalDetected).toBe(false);
   });
 
@@ -303,7 +383,6 @@ describe('captureScreenshots', () => {
     const viewport = { width: 1920, height: 1080 };
 
     const result = await captureScreenshots(page, 'https://example.com', '/out', viewport);
-
     expect(result.viewport).toEqual({ width: 1920, height: 1080 });
   });
 
@@ -321,32 +400,33 @@ describe('captureScreenshots', () => {
   });
 
   // -------------------------------------------------------------------------
-  // PNG dimension extraction
+  // PNG/JPEG dimension extraction
   // -------------------------------------------------------------------------
 
-  it('extracts correct dimensions from the PNG buffer', async () => {
+  it('extracts correct dimensions from a PNG full-page screenshot', async () => {
     const pngBuffer = makePngBuffer(1920, 3200);
-    const page = createMockPage({
-      url: 'https://example.com/',
-      screenshotBuffer: pngBuffer,
-    });
+    const page = createMockPage({ url: 'https://example.com/', screenshotBuffer: pngBuffer });
 
-    const result = await captureScreenshots(page, 'https://example.com', '/out');
+    const result = await captureScreenshots(page, 'https://example.com', '/out', undefined, {
+      format: 'png',
+    });
 
     expect(result.dimensions).toEqual({ width: 1920, height: 3200 });
   });
 
-  it('returns zero dimensions for a buffer too small to be a valid PNG', async () => {
-    // A buffer smaller than 24 bytes cannot contain IHDR width/height
-    const tinyBuffer = Buffer.alloc(10);
-    const page = createMockPage({
-      url: 'https://example.com/',
-      screenshotBuffer: tinyBuffer,
-    });
+  it('extracts correct dimensions from a JPEG full-page screenshot', async () => {
+    const jpegBuffer = makeJpegBuffer(1600, 900);
+    const page = createMockPage({ url: 'https://example.com/', screenshotBuffer: jpegBuffer });
 
     const result = await captureScreenshots(page, 'https://example.com', '/out');
 
-    expect(result.dimensions).toEqual({ width: 0, height: 0 });
+    expect(result.dimensions).toEqual({ width: 1600, height: 900 });
+  });
+
+  it('parseJpegDimensions returns zero for a buffer without SOF marker', () => {
+    // Only SOI, no SOF0/SOF2 — should resolve to 0x0.
+    const buf = Buffer.from([0xff, 0xd8, 0x00, 0x00]);
+    expect(parseJpegDimensions(buf)).toEqual({ width: 0, height: 0 });
   });
 
   // -------------------------------------------------------------------------
@@ -355,9 +435,7 @@ describe('captureScreenshots', () => {
 
   it('uses default viewport 1280x720 when none is provided', async () => {
     const page = createMockPage({ url: 'https://example.com/' });
-
     const result = await captureScreenshots(page, 'https://example.com', '/out');
-
     expect(result.viewport).toEqual({ width: 1280, height: 720 });
   });
 
@@ -366,7 +444,6 @@ describe('captureScreenshots', () => {
     const viewport = { width: 768, height: 1024 };
 
     const result = await captureScreenshots(page, 'https://example.com', '/out', viewport);
-
     expect(result.viewport).toEqual({ width: 768, height: 1024 });
   });
 
@@ -379,7 +456,6 @@ describe('captureScreenshots', () => {
     vi.mocked(stat).mockResolvedValueOnce({ size: 54321 } as any);
 
     const result = await captureScreenshots(page, 'https://example.com', '/out');
-
     expect(result.fileSizeBytes).toBe(54321);
   });
 

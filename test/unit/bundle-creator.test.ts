@@ -10,7 +10,11 @@ import { mkdtemp, writeFile, mkdir, readFile, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createHash } from 'node:crypto';
-import { createBundle, computeSha256 } from '../../src/bundle/bundle-creator.js';
+import {
+  createBundle,
+  computeSha256,
+  isSafeBundlePath,
+} from '../../src/bundle/bundle-creator.js';
 
 let testDir: string;
 let outputDir: string;
@@ -187,5 +191,67 @@ describe('createBundle', () => {
 
     const date = new Date(manifest.createdAt);
     expect(date.getTime()).not.toBeNaN();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// isSafeBundlePath
+// ---------------------------------------------------------------------------
+
+describe('isSafeBundlePath', () => {
+  const root = '/tmp/bundle';
+
+  it('accepts a simple relative path', () => {
+    expect(isSafeBundlePath('data/sitemap.json', root)).toBe(true);
+  });
+
+  it('accepts a nested relative path', () => {
+    expect(isSafeBundlePath('screenshots/page-1/full.png', root)).toBe(true);
+  });
+
+  it('rejects empty string', () => {
+    expect(isSafeBundlePath('', root)).toBe(false);
+  });
+
+  it('rejects `..` segments', () => {
+    expect(isSafeBundlePath('../etc/passwd', root)).toBe(false);
+    expect(isSafeBundlePath('data/../../etc/passwd', root)).toBe(false);
+  });
+
+  it('rejects POSIX absolute paths', () => {
+    expect(isSafeBundlePath('/etc/passwd', root)).toBe(false);
+  });
+
+  it('rejects Windows drive letter paths', () => {
+    expect(isSafeBundlePath('C:\\Windows\\System32', root)).toBe(false);
+    expect(isSafeBundlePath('C:/Windows/System32', root)).toBe(false);
+    expect(isSafeBundlePath('d:\\tmp\\file.txt', root)).toBe(false);
+  });
+
+  it('rejects UNC paths', () => {
+    expect(isSafeBundlePath('\\\\server\\share\\file', root)).toBe(false);
+    expect(isSafeBundlePath('//server/share/file', root)).toBe(false);
+  });
+
+  it('rejects percent-encoded traversal', () => {
+    expect(isSafeBundlePath('..%2fetc%2fpasswd', root)).toBe(false);
+    expect(isSafeBundlePath('%2e%2e/etc/passwd', root)).toBe(false);
+    expect(isSafeBundlePath('%2E%2E%2Fetc', root)).toBe(false);
+  });
+
+  it('rejects malformed percent-encoding', () => {
+    // decodeURIComponent throws on malformed input — we reject rather than
+    // trust the undecoded string.
+    expect(isSafeBundlePath('foo%ZZ', root)).toBe(false);
+  });
+
+  it('accepts names that start with dots but are not `..`', () => {
+    expect(isSafeBundlePath('.hidden/file', root)).toBe(true);
+    expect(isSafeBundlePath('..foo', root)).toBe(true);
+    expect(isSafeBundlePath('foo..bar', root)).toBe(true);
+  });
+
+  it('rejects mixed-separator traversal on Windows', () => {
+    expect(isSafeBundlePath('data\\..\\..\\..\\etc', root)).toBe(false);
   });
 });

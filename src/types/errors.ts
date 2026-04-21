@@ -158,6 +158,32 @@ export class FrontierError extends ArchaeologistError {
   }
 }
 
+/**
+ * Thrown when the Frontier's seen-set grows beyond the configured
+ * `maxSeen` bound. The crawler cannot continue to dedupe without
+ * unbounded memory growth, so we abort with guidance to raise the limit.
+ *
+ * Future work: swap the seen-set for a Bloom filter above N million
+ * entries; that would trade a tiny false-positive rate (missed re-visit)
+ * for flat memory. Out of scope for this wave.
+ */
+export class FrontierOverflowError extends ArchaeologistError {
+  readonly seenCount: number;
+  readonly maxSeen: number;
+
+  constructor(seenCount: number, maxSeen: number) {
+    super(
+      `Frontier seen-set exceeded ${maxSeen} URLs (current: ${seenCount}). ` +
+        `Raise the limit with Frontier({ maxSeen: N }), split the crawl with ` +
+        `--include patterns, or narrow --depth / --max-pages.`,
+      'ERR_FRONTIER_OVERFLOW',
+    );
+    this.name = 'FrontierOverflowError';
+    this.seenCount = seenCount;
+    this.maxSeen = maxSeen;
+  }
+}
+
 export type SecurityBlockReason =
   | 'private_ip'
   | 'blocked_protocol'
@@ -258,6 +284,22 @@ export type BundleErrorReason =
   | 'unsupported_version'
   | 'output_dir_not_writable';
 
+// ---------------------------------------------------------------------------
+// Installation errors (browser missing / unable to launch)
+// ---------------------------------------------------------------------------
+
+/**
+ * Thrown when Playwright Chromium cannot be launched because the browser
+ * binary is missing or otherwise unavailable. Matches common Playwright
+ * error shapes (ENOENT, "Executable doesn't exist", "Failed to launch").
+ */
+export class InstallationError extends ArchaeologistError {
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, 'ERR_INSTALLATION', options);
+    this.name = 'InstallationError';
+  }
+}
+
 export class BundleError extends ArchaeologistError {
   readonly reason: BundleErrorReason;
   readonly bundlePath?: string;
@@ -271,6 +313,26 @@ export class BundleError extends ArchaeologistError {
 }
 
 // ---------------------------------------------------------------------------
+// Security errors (explicit security-gate failures)
+// ---------------------------------------------------------------------------
+
+export type SecurityErrorReason =
+  | 'auth_script_dangerous'
+  | 'path_traversal'
+  | 'dns_rebinding'
+  | 'disallowed_url';
+
+export class SecurityError extends ArchaeologistError {
+  readonly reason: SecurityErrorReason;
+
+  constructor(reason: SecurityErrorReason, message: string, options?: ErrorOptions) {
+    super(message, 'ERR_SECURITY', options);
+    this.name = 'SecurityError';
+    this.reason = reason;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Error classification helpers
 // ---------------------------------------------------------------------------
 
@@ -280,6 +342,7 @@ export function isFatalError(err: unknown): boolean {
   if (err instanceof AuthError) return true;
   if (err instanceof AssemblerError) return true;
   if (err instanceof BundleError && err.reason === 'output_dir_not_writable') return true;
+  if (err instanceof SecurityError) return true;
   return false;
 }
 

@@ -420,6 +420,44 @@ describe('screenshot diffing', () => {
     expect(result.screenshots.unchangedCount).toBe(1);
     expect(result.summary.screenshots.unchanged).toBe(1);
   });
+
+  it('emits a pixel-accurate diffPercentage and heatmap when PNGs exist', async () => {
+    const { PNG } = await import('pngjs');
+    const makePng = (width: number, height: number, rgba: [number, number, number, number]): Buffer => {
+      const png = new PNG({ width, height });
+      const [r, g, b, a] = rgba;
+      for (let i = 0; i < png.data.length; i += 4) {
+        png.data[i] = r;
+        png.data[i + 1] = g;
+        png.data[i + 2] = b;
+        png.data[i + 3] = a;
+      }
+      return PNG.sync.write(png);
+    };
+
+    const files = [
+      { path: 'screenshots/home.png', sha256: 'aaaa', size: 100, type: 'screenshot' as const },
+    ];
+    await writeBundle(oldDir, makeManifest({ files }));
+    await writeBundle(newDir, makeManifest({
+      files: [{ path: 'screenshots/home.png', sha256: 'bbbb', size: 100, type: 'screenshot' }],
+    }));
+
+    await writeFile(join(oldDir, 'screenshots', 'home.png'), makePng(8, 8, [255, 0, 0, 255]));
+    await writeFile(join(newDir, 'screenshots', 'home.png'), makePng(8, 8, [0, 0, 255, 255]));
+
+    const heatmapDir = join(testDir, 'heatmaps');
+    const result = await diffBundles(oldDir, newDir, { heatmapDir });
+
+    expect(result.screenshots.changed).toHaveLength(1);
+    const change = result.screenshots.changed[0];
+    expect(change.diffPercentage).toBeGreaterThan(0);
+    expect(change.diffPercentage).toBeLessThanOrEqual(100);
+    expect(change.diffPixelCount).toBeGreaterThan(0);
+    expect(change.totalPixels).toBe(64);
+    expect(change.heatmapPath).toBeDefined();
+    expect(change.heatmapPath!.startsWith(heatmapDir)).toBe(true);
+  });
 });
 
 // ---------------------------------------------------------------------------

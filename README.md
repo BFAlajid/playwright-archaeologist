@@ -45,8 +45,11 @@ npx playwright-archaeologist dig https://example.com
 - **Form catalog** — extracts every form with field metadata, validation rules, and structure
 - **Flow graph** — Mermaid navigation diagrams showing how pages connect
 - **Regression diff** — compare two crawl snapshots, detect structural and visual changes
-- **Security-first** — SSRF protection, credential scrubbing, browser CSP hardening
-- **Resume support** — checkpoint and resume interrupted crawls
+- **Security-first** — SSRF protection, DNS pinning, HAR credential scrubbing, auth-script sandboxing, browser CSP hardening
+- **Accessibility audit** — optional axe-core integration produces a per-page WCAG report (`--with-a11y`)
+- **Visual regression** — pixel-accurate screenshot diffs with colored heatmap PNGs (`pa diff`)
+- **Real concurrency** — `--concurrency N` runs N parallel browser contexts against the frontier
+- **Plugin API** — programmatic `Collector` interface for adding custom per-page data capture
 
 ---
 
@@ -96,8 +99,14 @@ pa dig https://myapp.com --deep-click
 # Custom output directory
 pa dig https://myapp.com -o ./crawl-output
 
-# Resume an interrupted crawl
-pa dig https://myapp.com --resume
+# Run axe-core accessibility audit on every page
+pa dig https://myapp.com --with-a11y
+
+# JPEG screenshots (default) or PNG
+pa dig https://myapp.com --screenshot-format png
+
+# Emit pretty-printed JSON artifacts
+pa dig https://myapp.com --pretty
 ```
 
 ### Compare two snapshots
@@ -140,11 +149,10 @@ pa dig https://myapp.com --cookies ./cookies.json
 | `--no-screenshots` | `false` | Skip screenshot capture |
 | `--viewport <WxH>` | `1280x720` | Viewport dimensions |
 | `--viewports <list>` | — | Comma-separated viewport list for multi-viewport screenshots |
-| `--deep-click` | `false` | Click interactive elements to discover SPA routes |
-| `--resume` | `false` | Resume from the last checkpoint |
+| `--deep-click` | `false` | Click interactive elements to discover SPA routes (not yet wired) |
 | `--include <pattern>` | — | URL patterns to include (repeatable) |
 | `--exclude <pattern>` | — | URL patterns to exclude (repeatable) |
-| `--follow-external` | `false` | Follow links to external origins |
+| `--follow-external` | `false` | Follow links to external origins (defeats same-origin SSRF assumption) |
 | `--include-iframes` | `false` | Crawl cross-origin iframes |
 | `--delay <ms>` | `0` | Delay between page visits (0-60000ms) |
 | `--timeout <ms>` | `30000` | Per-page navigation timeout (1000-300000ms) |
@@ -152,9 +160,22 @@ pa dig https://myapp.com --cookies ./cookies.json
 | `--include-cookies` | `false` | Include cookies and auth data in output |
 | `-f, --format <fmt>` | `both` | Output format: `html`, `json`, `openapi`, `both` |
 | `--no-har` | `false` | Skip HAR recording |
-| `--allow-private` | `false` | Bypass SSRF protection (allow private IPs) |
+| `--har-include-bodies` | `false` | Include response bodies in the HAR (default: omit) |
+| `--capture-js-bodies` | `false` | Capture `application/javascript` response bodies (default off; bundle files often leak API keys) |
+| `--screenshot-format <fmt>` | `jpeg` | Full-page screenshot format: `jpeg` (quality 80) or `png` |
+| `--with-a11y` | `false` | Run axe-core on each page and emit an accessibility report |
+| `--allow-private` | `false` | Bypass SSRF protection (allow private IPs, e.g. `localhost`) |
+| `--allow-auth-script` | `false` | Explicit opt-in to run user-supplied `--auth` scripts past the validator |
+| `--pretty` | `false` | Emit pretty-printed JSON artifacts (2-space indent) |
 | `-y, --yes` | `false` | Skip confirmation prompts |
 | `-v, --verbose` | `false` | Enable debug logging |
+
+### Output formats
+
+- `--format html` — only `report.html`.
+- `--format json` — only `sitemap.json`, `forms.json`, `api-map.json`, `crawl-summary.json`.
+- `--format openapi` — additionally writes `openapi.json` (OpenAPI 3.0 inferred from observed traffic).
+- `--format both` (default) — HTML report plus all JSON artifacts plus OpenAPI.
 
 ### `pa diff` options
 
@@ -165,8 +186,8 @@ pa dig https://myapp.com --cookies ./cookies.json
 | `--format-junit <path>` | — | Write a JUnit XML report |
 | `--format-markdown <path>` | — | Write a Markdown report |
 | `-o, --output <dir>` | — | Output directory for diff artifacts |
-| `--threshold <n>` | `0.1` | Pixel diff threshold (0-1) |
-| `--max-ratio <n>` | `0.5` | Max allowed diff ratio (0-100) |
+| `--threshold <n>` | `0.1` | Pixel diff threshold per pixel (0-1) passed to pixelmatch |
+| `--max-ratio <n>` | `0.5` | Max allowed diff ratio as a percentage (e.g. `0.5` = 0.5% of pixels) |
 | `--ignore-fields <fields>` | `timestamp,createdAt,...` | Comma-separated fields to ignore in comparisons |
 | `--normalize-dynamic` | `false` | Normalize UUIDs/timestamps before diff |
 | `--detailed` | `false` | Show value-level diffs (not just schema-level) |
@@ -185,16 +206,17 @@ After a crawl, the `.archaeologist/` directory contains:
   forms.json             # Form catalog with field details
   api-map.json           # Observed API endpoints
   openapi.json           # Generated OpenAPI 3.0 specification
+  accessibility.json     # Only present with --with-a11y: per-page axe results
   flow-graph.mmd         # Navigation flow diagram (Mermaid text)
-  screenshots/           # Full-page and viewport screenshots
-    index_full.png
+  crawl.har              # Network capture (scrubbed; bodies omitted unless --har-include-bodies)
+  screenshots/           # Full-page (JPEG by default) and viewport (PNG) screenshots
+    index_full.jpg
     index_viewport.png
     ...
   bundle/                # Snapshot bundle for regression diffing
     manifest.json
     data/
     screenshots/
-  checkpoint.json        # Resume checkpoint (deleted on completion)
 ```
 
 ---
@@ -204,10 +226,11 @@ After a crawl, the `.archaeologist/` directory contains:
 Use `playwright-archaeologist` as a library in your own tools:
 
 ```typescript
-import { dig, CrawlConfigSchema } from 'playwright-archaeologist';
+import { dig, resolveConfig } from 'playwright-archaeologist';
 
-// Validate and resolve config via Zod schema
-const config = CrawlConfigSchema.parse({
+// resolveConfig normalizes the URL, applies defaults, validates via Zod,
+// and resolves outputDir/authScript/cookiesFile to absolute paths.
+const config = resolveConfig({
   targetUrl: 'https://myapp.com',
   depth: 3,
   maxPages: 50,
@@ -230,7 +253,10 @@ console.log(`Discovered ${result.artifacts.apiEndpoints.length} API endpoints`);
 import { diffBundles, generateDiffReportHtml } from 'playwright-archaeologist';
 import { writeFile } from 'node:fs/promises';
 
-const diff = await diffBundles('./old-bundle', './new-bundle');
+const diff = await diffBundles('./old-bundle', './new-bundle', {
+  // Emit pixel-diff heatmap PNGs next to the report
+  heatmapDir: './diff-output/heatmaps',
+});
 
 if (diff.hasChanges) {
   const s = diff.summary;
@@ -244,6 +270,35 @@ if (diff.hasChanges) {
   await writeFile('diff-report.html', html);
 }
 ```
+
+### Custom collectors (programmatic plugin API)
+
+```typescript
+import { dig, resolveConfig, CollectorRegistry, type Collector } from 'playwright-archaeologist';
+
+// A custom collector captures the number of images on each page.
+const imageCountCollector: Collector<{ count: number }> = {
+  name: 'image-count',
+  async collect({ page }) {
+    const count = await page.locator('img').count();
+    return { count };
+  },
+};
+
+const config = resolveConfig({
+  targetUrl: 'https://myapp.com',
+  collectors: [imageCountCollector],
+});
+
+const result = await dig(config);
+
+// Results land in each page.pluginData under the collector name.
+for (const page of result.pages) {
+  console.log(page.url, page.pluginData?.['image-count']);
+}
+```
+
+Collectors run with a 30-second per-plugin timeout; a failing plugin records an error on the page but does not stop the crawl.
 
 ### Using individual collectors
 

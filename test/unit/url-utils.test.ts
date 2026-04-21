@@ -5,7 +5,7 @@
  * hash routing detection, and relative URL resolution.
  */
 
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeEach } from 'vitest';
 import {
   normalizeUrl,
   isSameOrigin,
@@ -15,6 +15,7 @@ import {
   resolveUrl,
   stripAuthInfo,
   shouldCrawl,
+  __clearNormalizeUrlCacheForTesting,
 } from '../../src/crawl/url-utils.js';
 
 // ---------------------------------------------------------------------------
@@ -527,5 +528,69 @@ describe('shouldCrawl', () => {
         exclude: ['**/admin/**'],
       })
     ).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// normalizeUrl memoization
+//
+// Performance invariant: repeated calls with the same input must NOT
+// re-parse and re-sort. The cache is an LRU-ish Map; cold miss computes
+// and stores, warm hit returns the previously computed value.
+// ---------------------------------------------------------------------------
+
+describe('normalizeUrl memoization', () => {
+  beforeEach(() => {
+    __clearNormalizeUrlCacheForTesting();
+  });
+
+  it('returns the same cached string reference on repeat calls', () => {
+    const input = 'https://example.com/path?z=1&a=2';
+    const first = normalizeUrl(input);
+    const second = normalizeUrl(input);
+
+    // Same referential identity — proves the cache returned the stored
+    // string rather than re-computing (which would yield a fresh string).
+    expect(second).toBe(first);
+  });
+
+  it('distinguishes cache entries by preserveHash option', () => {
+    const url = 'https://example.com/p#section';
+
+    const stripped = normalizeUrl(url);
+    const preserved = normalizeUrl(url, { preserveHash: true });
+
+    expect(stripped).toBe('https://example.com/p');
+    expect(preserved).toBe('https://example.com/p#section');
+
+    // Both cached independently; neither call should leak into the other.
+    expect(normalizeUrl(url)).toBe(stripped);
+    expect(normalizeUrl(url, { preserveHash: true })).toBe(preserved);
+  });
+
+  it('produces correct output on cache hit (no stale data)', () => {
+    const url = 'https://example.com/p?b=1&a=2';
+    const expected = 'https://example.com/p?a=2&b=1';
+
+    expect(normalizeUrl(url)).toBe(expected);
+    expect(normalizeUrl(url)).toBe(expected);
+    expect(normalizeUrl(url)).toBe(expected);
+  });
+
+  it('remains correct under cache eviction pressure', () => {
+    // Fill well past the 10_000 cap. If eviction is buggy this will either
+    // OOM or yield wrong answers for the early URLs.
+    for (let i = 0; i < 12_000; i++) {
+      normalizeUrl(`https://example.com/path${i}?z=1&a=2`);
+    }
+
+    // The oldest entries should have been evicted, but recomputing still
+    // produces the correct output.
+    expect(normalizeUrl('https://example.com/path0?z=1&a=2')).toBe(
+      'https://example.com/path0?a=2&z=1',
+    );
+    expect(normalizeUrl('https://example.com/path11999?z=1&a=2')).toBe(
+      'https://example.com/path11999?a=2&z=1',
+    );
   });
 });

@@ -12,6 +12,7 @@
  */
 
 import { normalizeUrl } from './url-utils';
+import { FrontierOverflowError } from '../types/errors';
 
 export interface FrontierEntry {
   url: string;
@@ -19,18 +20,40 @@ export interface FrontierEntry {
   referrer?: string;
 }
 
+/**
+ * Default upper bound on the seen-set size. 500k URLs × ~100 bytes each
+ * keeps the frontier under ~50 MB of resident memory. Crawls that legitimately
+ * need more can raise `maxSeen`; the alternative is a Bloom filter (future
+ * work).
+ */
+const DEFAULT_MAX_SEEN = 500_000;
+
+export interface FrontierOptions {
+  maxDepth?: number;
+  /**
+   * Upper bound on the seen-set. When the count exceeds this limit,
+   * `enqueue` throws `FrontierOverflowError` so the crawl fails loudly
+   * rather than silently eating memory.
+   */
+  maxSeen?: number;
+}
+
 export class Frontier {
   private queue: FrontierEntry[] = [];
   private head: number = 0;
   private seen: Set<string> = new Set();
   private maxDepth: number;
+  private maxSeen: number;
 
-  constructor(options: { maxDepth?: number } = {}) {
+  constructor(options: FrontierOptions = {}) {
     this.maxDepth = options.maxDepth ?? Infinity;
+    this.maxSeen = options.maxSeen ?? DEFAULT_MAX_SEEN;
   }
 
   /**
    * Add a URL to the queue. Returns false if already seen or exceeds max depth.
+   * Throws `FrontierOverflowError` when adding this URL would push the seen-set
+   * past `maxSeen`.
    */
   enqueue(entry: FrontierEntry): boolean {
     if (entry.depth > this.maxDepth) {
@@ -41,6 +64,12 @@ export class Frontier {
 
     if (this.seen.has(normalized)) {
       return false;
+    }
+
+    // Check before insertion so the error reflects the limit, not an
+    // off-by-one overshoot.
+    if (this.seen.size >= this.maxSeen) {
+      throw new FrontierOverflowError(this.seen.size, this.maxSeen);
     }
 
     this.seen.add(normalized);

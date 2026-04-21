@@ -1,3 +1,6 @@
+# CI pipeline: lint, typecheck, build, unit tests on a 3-OS x 2-Node matrix.
+# Integration tests (requiring Chromium) run only on ubuntu-latest to keep the
+# matrix fast; platform-specific issues usually surface in unit tests anyway.
 name: CI
 
 on:
@@ -6,31 +9,106 @@ on:
   pull_request:
     branches: [master]
 
-jobs:
-  build-and-test:
-    runs-on: ubuntu-latest
+# Read-only by default. Jobs that need more will opt in explicitly.
+permissions:
+  contents: read
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Fast lane: runs on every OS/Node combination. No browser install.
+  unit:
+    name: Unit (${{ matrix.os }} / Node ${{ matrix.node }})
+    runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
-        node-version: [20.x, 22.x]
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        node: [20, 22]
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Use Node.js ${{ matrix.node-version }}
+      - name: Setup Node.js ${{ matrix.node }}
         uses: actions/setup-node@v4
         with:
-          node-version: ${{ matrix.node-version }}
+          node-version: ${{ matrix.node }}
           cache: npm
 
       - name: Install dependencies
         run: npm ci
 
+      # Drift guard: `npm ci` does not mutate the lockfile, but if a future
+      # refactor ever switches to `npm install` in CI, this step ensures the
+      # lockfile remains canonical and PRs don't silently diverge.
+      - name: Lockfile drift check
+        run: git diff --exit-code package-lock.json
+
+      - name: Lint
+        run: npm run lint
+        continue-on-error: true
+
       - name: Type check
-        run: npx tsc --noEmit
+        run: npm run typecheck
 
       - name: Build
         run: npm run build
 
       - name: Unit tests
         run: npm run test:unit
+
+      # Log the tarball contents so reviewers see what would actually ship.
+      - name: Pack dry-run
+        if: matrix.os == 'ubuntu-latest' && matrix.node == 20
+        run: npm pack --dry-run
+
+      # Non-blocking audit of runtime deps. Fail budget: reviewed manually.
+      - name: npm audit (runtime)
+        if: matrix.os == 'ubuntu-latest' && matrix.node == 20
+        run: npm audit --omit=dev --audit-level=high
+        continue-on-error: true
+
+  # Slow lane: integration tests require Chromium. Linux-only; gated on unit.
+  integration:
+    name: Integration (ubuntu-latest / Node 20)
+    runs-on: ubuntu-latest
+    needs: unit
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      # Cache the Playwright browser binaries. Keyed on the resolved playwright
+      # version in the lockfile so upgrades invalidate automatically.
+      - name: Compute Playwright version
+        id: pw
+        shell: bash
+        run: |
+          version=$(node -p "require('./node_modules/playwright/package.json').version")
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ steps.pw.outputs.version }}
+          restore-keys: |
+            playwright-${{ runner.os }}-
+
+      - name: Install Chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: Build
+        run: npm run build
+
+      - name: Integration tests
+        run: npm run test:integration

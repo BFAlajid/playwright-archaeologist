@@ -8,6 +8,8 @@
 import { describe, it, expect } from 'vitest';
 import {
   generateReportHtml,
+  generateMermaidSvgString,
+  computeAnomalyCounts,
   type ReportInput,
   type ReportPage,
   type ReportForm,
@@ -23,7 +25,8 @@ function minimalInput(): ReportInput {
   return {
     targetUrl: 'https://example.com',
     crawlDate: '2026-03-09T12:00:00Z',
-    duration: 42,
+    // duration is in milliseconds
+    duration: 42_000,
     pagesVisited: 10,
     errors: 1,
     forms: [],
@@ -94,7 +97,8 @@ function fullInput(): ReportInput {
     title: 'My Test Report',
     targetUrl: 'https://example.com',
     crawlDate: '2026-03-09T12:00:00Z',
-    duration: 125.5,
+    // duration is in milliseconds — 125.5s -> 125_500ms
+    duration: 125_500,
     pagesVisited: 6,
     errors: 2,
     pages,
@@ -573,39 +577,6 @@ describe('generateReportHtml', () => {
   });
 
   // ---------------------------------------------------------------------------
-  // JSON data block
-  // ---------------------------------------------------------------------------
-
-  describe('JSON data block', () => {
-    it('includes JSON data block with correct id', () => {
-      const html = generateReportHtml(minimalInput());
-      expect(html).toContain('<script type="application/json" id="report-data">');
-    });
-
-    it('contains report metadata in JSON', () => {
-      const html = generateReportHtml(minimalInput());
-      const match = html.match(/<script type="application\/json" id="report-data">([\s\S]*?)<\/script>/);
-      expect(match).toBeTruthy();
-      const json = JSON.parse(match![1]);
-      expect(json.targetUrl).toBe('https://example.com');
-      expect(json.crawlDate).toBe('2026-03-09T12:00:00Z');
-      expect(json.pagesVisited).toBe(10);
-      expect(json.errors).toBe(1);
-    });
-
-    it('escapes dangerous content in JSON block', () => {
-      const input = minimalInput();
-      input.targetUrl = 'https://example.com/</script><script>alert(1)</script>';
-      const html = generateReportHtml(input);
-      // The raw </script> inside the JSON block should be escaped
-      const match = html.match(/<script type="application\/json" id="report-data">([\s\S]*?)<\/script>/);
-      expect(match).toBeTruthy();
-      // The JSON block should not contain raw </script>
-      expect(match![1]).not.toContain('</script>');
-    });
-  });
-
-  // ---------------------------------------------------------------------------
   // Edge cases
   // ---------------------------------------------------------------------------
 
@@ -634,16 +605,530 @@ describe('generateReportHtml', () => {
 
     it('handles duration formatting for short durations', () => {
       const input = minimalInput();
-      input.duration = 5.3;
+      // 5.3 seconds in ms
+      input.duration = 5_300;
       const html = generateReportHtml(input);
       expect(html).toContain('5.3s');
     });
 
     it('handles duration formatting for long durations', () => {
       const input = minimalInput();
-      input.duration = 185;
+      // 185 seconds = 3m 5s, in ms
+      input.duration = 185_000;
       const html = generateReportHtml(input);
       expect(html).toContain('3m');
     });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Form rendering — field name + badge classification
+  // ---------------------------------------------------------------------------
+
+  describe('form field rendering', () => {
+    it('shows (unnamed) fallback when form field name is empty', () => {
+      const input = minimalInput();
+      input.forms = [{
+        url: 'https://example.com/contact',
+        action: '',
+        method: 'GET',
+        fields: [
+          { name: '', type: 'text', required: true },
+          { name: '', type: 'email', required: true },
+        ],
+      }];
+      const html = generateReportHtml(input);
+      expect(html).toContain('(unnamed): text');
+      expect(html).toContain('(unnamed): email');
+    });
+
+    it('applies badge-required to required fields only', () => {
+      const input = minimalInput();
+      input.forms = [{
+        url: 'https://example.com/login',
+        action: '/login',
+        method: 'POST',
+        fields: [
+          { name: 'user', type: 'text', required: true },
+          { name: 'remember', type: 'checkbox', required: false },
+        ],
+      }];
+      const html = generateReportHtml(input);
+      // Required text field gets badge-required; optional checkbox gets badge-field.
+      expect(html).toMatch(/badge badge-required[^"]*">user: text/);
+      expect(html).toMatch(/badge badge-field[^"]*">remember: checkbox/);
+    });
+
+    it('applies badge-sensitive to non-required sensitive types', () => {
+      const input = minimalInput();
+      input.forms = [{
+        url: 'https://example.com/signup',
+        action: '/signup',
+        method: 'POST',
+        fields: [
+          // Not required, but sensitive type -> badge-sensitive
+          { name: 'email', type: 'email', required: false },
+          { name: 'phone', type: 'tel', required: false },
+          { name: 'pw', type: 'password', required: false },
+        ],
+      }];
+      const html = generateReportHtml(input);
+      expect(html).toMatch(/badge badge-sensitive[^"]*">email: email/);
+      expect(html).toMatch(/badge badge-sensitive[^"]*">phone: tel/);
+      expect(html).toMatch(/badge badge-sensitive[^"]*">pw: password/);
+    });
+
+    it('prefers badge-required over badge-sensitive when both apply', () => {
+      const input = minimalInput();
+      input.forms = [{
+        url: 'https://example.com/login',
+        action: '/login',
+        method: 'POST',
+        fields: [
+          { name: 'pw', type: 'password', required: true },
+        ],
+      }];
+      const html = generateReportHtml(input);
+      expect(html).toMatch(/badge badge-required[^"]*">pw: password/);
+      expect(html).not.toMatch(/badge badge-sensitive[^"]*">pw: password/);
+    });
+
+    it('renders a legend explaining the badge colors', () => {
+      const input = minimalInput();
+      input.forms = [{
+        url: 'https://example.com/',
+        action: '',
+        method: 'GET',
+        fields: [{ name: 'x', type: 'text', required: false }],
+      }];
+      const html = generateReportHtml(input);
+      expect(html).toContain('class="form-legend"');
+      expect(html).toContain('Red = required');
+      expect(html).toContain('Yellow = sensitive');
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// generateMermaidSvgString fallback
+// ---------------------------------------------------------------------------
+
+describe('generateMermaidSvgString', () => {
+  it('wraps the Mermaid definition in a <pre> block', () => {
+    const out = generateMermaidSvgString('graph TD\n  A-->B');
+    expect(out).toContain('<pre class="mermaid-source">');
+    expect(out).toContain('graph TD');
+    expect(out).toContain('A--&gt;B');
+  });
+
+  it('escapes HTML entities inside the definition', () => {
+    const out = generateMermaidSvgString('graph TD\n  A["<script>alert(1)</script>"]');
+    expect(out).not.toContain('<script>alert');
+    expect(out).toContain('&lt;script&gt;');
+  });
+
+  it('returns empty string for empty definition', () => {
+    expect(generateMermaidSvgString('')).toBe('');
+    expect(generateMermaidSvgString('   \n  ')).toBe('');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Anomaly summary row (Fix A)
+// ---------------------------------------------------------------------------
+
+describe('executive summary anomaly row', () => {
+  it('renders the anomaly labels in the second stat row', () => {
+    const html = generateReportHtml(minimalInput());
+    expect(html).toContain('4xx Routes');
+    expect(html).toContain('5xx Routes');
+    expect(html).toContain('POST Endpoints');
+    expect(html).toContain('Forms With Password');
+    expect(html).toContain('Auth-Gated Pages');
+  });
+
+  it('counts 4xx and 5xx routes and links them to #sitemap', () => {
+    const input: ReportInput = {
+      ...minimalInput(),
+      pages: [
+        { url: 'https://ex.com/a', title: 'A', status: 200 },
+        { url: 'https://ex.com/b', title: 'B', status: 404 },
+        { url: 'https://ex.com/c', title: 'C', status: 403 },
+        { url: 'https://ex.com/d', title: 'D', status: 500 },
+        { url: 'https://ex.com/e', title: 'E', status: 502 },
+      ],
+    };
+    const anomalies = computeAnomalyCounts(input);
+    expect(anomalies.status4xx).toBe(2); // 404 + 403
+    expect(anomalies.status5xx).toBe(2); // 500 + 502
+    expect(anomalies.authGated).toBe(1); // 403
+
+    const html = generateReportHtml(input);
+    // Non-zero counts render anchor links to #sitemap
+    expect(html).toMatch(/<a href="#sitemap">2<\/a>/);
+  });
+
+  it('counts POST API endpoints and forms with password fields', () => {
+    const input: ReportInput = {
+      ...minimalInput(),
+      forms: [
+        {
+          url: 'https://ex.com/login',
+          action: '/login',
+          method: 'POST',
+          fields: [
+            { name: 'user', type: 'text', required: true },
+            { name: 'pw', type: 'password', required: true },
+          ],
+        },
+        {
+          url: 'https://ex.com/search',
+          action: '/search',
+          method: 'GET',
+          fields: [{ name: 'q', type: 'text', required: false }],
+        },
+      ],
+      apiEndpoints: [
+        { pattern: '/api/a', method: 'GET' },
+        { pattern: '/api/b', method: 'POST' },
+        { pattern: '/api/c', method: 'POST' },
+      ],
+    };
+    const anomalies = computeAnomalyCounts(input);
+    expect(anomalies.formsWithPassword).toBe(1);
+    expect(anomalies.postEndpoints).toBe(2);
+  });
+
+  it('renders zero counts as plain text, not as links', () => {
+    const html = generateReportHtml(minimalInput());
+    // All five anomaly cards render zero with no anchor, since input has no pages/forms/endpoints
+    const anomalySection = html.split('stats-anomalies')[1];
+    expect(anomalySection).toBeTruthy();
+    // With empty inputs, no anchor links should appear in the anomaly row
+    expect(anomalySection!.split('<div class="stat-card">')[1]).not.toContain('href="#');
+  });
+
+  it('colors non-zero anomaly counts with stat-nonzero class', () => {
+    const input: ReportInput = {
+      ...minimalInput(),
+      pages: [{ url: 'https://ex.com/x', title: 'X', status: 500 }],
+    };
+    const html = generateReportHtml(input);
+    expect(html).toContain('stat-value stat-nonzero');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Sitemap tree — children INSIDE li (Fix B)
+// ---------------------------------------------------------------------------
+
+describe('sitemap tree a11y structure', () => {
+  it('declares role=tree on the outer ul', () => {
+    const html = generateReportHtml(fullInput());
+    expect(html).toMatch(/<ul class="sitemap-tree" role="tree">/);
+  });
+
+  it('uses role=treeitem on each li', () => {
+    const html = generateReportHtml(fullInput());
+    expect(html).toContain('<li role="treeitem"');
+  });
+
+  it('places child <ul> INSIDE the parent <li>, not as a sibling', () => {
+    const input = minimalInput();
+    input.pages = [
+      { url: 'https://example.com/a', title: 'A', status: 200 },
+      { url: 'https://example.com/a/b', title: 'B', status: 200 },
+    ];
+    const html = generateReportHtml(input);
+    // Between the start of an <li> and the closing </li> there must be a <ul> child
+    // and the <ul> must NOT appear as a sibling outside <li>.
+    // Look for `<ul role="group">` nested inside a treeitem li.
+    const treeSection = html.split('class="sitemap-tree"')[1] ?? '';
+    expect(treeSection).toContain('<ul role="group">');
+    // Make sure no `</li>\s*<ul>` sibling pattern exists inside the tree
+    expect(treeSection).not.toMatch(/<\/li>\s*<ul/);
+  });
+
+  it('adds aria-expanded=true when a node has children', () => {
+    const input = minimalInput();
+    input.pages = [
+      { url: 'https://example.com/parent', title: 'Parent', status: 200 },
+      { url: 'https://example.com/parent/child', title: 'Child', status: 200 },
+    ];
+    const html = generateReportHtml(input);
+    expect(html).toContain('aria-expanded="true"');
+  });
+
+  it('renders a tree-toggle button on nodes with children', () => {
+    const input = minimalInput();
+    input.pages = [
+      { url: 'https://example.com/p', title: 'P', status: 200 },
+      { url: 'https://example.com/p/c', title: 'C', status: 200 },
+    ];
+    const html = generateReportHtml(input);
+    expect(html).toContain('class="tree-toggle"');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Semantic HTML landmarks (Fix C)
+// ---------------------------------------------------------------------------
+
+describe('semantic landmarks', () => {
+  it('wraps content in <main>', () => {
+    const html = generateReportHtml(minimalInput());
+    expect(html).toContain('<main class="container">');
+  });
+
+  it('uses <header> for title and stats', () => {
+    const html = generateReportHtml(minimalInput());
+    expect(html).toContain('<header class="report-header">');
+  });
+
+  it('uses <footer> with generator text', () => {
+    const html = generateReportHtml(minimalInput());
+    expect(html).toContain('<footer class="report-footer">');
+    expect(html).toContain('Generated by playwright-archaeologist');
+  });
+
+  it('uses <section> with aria-labelledby for each section', () => {
+    const html = generateReportHtml(fullInput());
+    expect(html).toContain('aria-labelledby="section-title-sitemap"');
+    expect(html).toContain('aria-labelledby="section-title-forms"');
+    expect(html).toContain('aria-labelledby="section-title-api"');
+    expect(html).toContain('aria-labelledby="section-title-screenshots"');
+    expect(html).toContain('aria-labelledby="section-title-flow"');
+  });
+
+  it('nav uses aria-label "Report sections"', () => {
+    const html = generateReportHtml(minimalInput());
+    expect(html).toContain('aria-label="Report sections"');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Sticky th offset (Fix D)
+// ---------------------------------------------------------------------------
+
+describe('sticky header offset', () => {
+  it('defines --nav-h CSS variable on :root', () => {
+    const html = generateReportHtml(minimalInput());
+    expect(html).toContain('--nav-h:');
+  });
+
+  it('uses var(--nav-h) in the th sticky top rule', () => {
+    const html = generateReportHtml(minimalInput());
+    expect(html).toContain('top: var(--nav-h)');
+  });
+
+  it('includes a ResizeObserver to track nav height', () => {
+    const html = generateReportHtml(minimalInput());
+    expect(html).toContain('ResizeObserver');
+    expect(html).toContain("--nav-h");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Theme toggle (Fix E)
+// ---------------------------------------------------------------------------
+
+describe('theme toggle', () => {
+  it('renders a theme-toggle button in the nav', () => {
+    const html = generateReportHtml(minimalInput());
+    expect(html).toContain('id="theme-toggle"');
+    expect(html).toContain('aria-label="Toggle theme"');
+  });
+
+  it('includes explicit data-theme overrides in CSS', () => {
+    const html = generateReportHtml(minimalInput());
+    expect(html).toContain(':root[data-theme="dark"]');
+    expect(html).toContain(':root[data-theme="light"]');
+  });
+
+  it('persists theme choice via localStorage', () => {
+    const html = generateReportHtml(minimalInput());
+    expect(html).toContain('localStorage');
+    expect(html).toContain('pa-theme');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Search improvements (Fix F)
+// ---------------------------------------------------------------------------
+
+describe('search improvements', () => {
+  it('renders a live-region search count', () => {
+    const html = generateReportHtml(minimalInput());
+    expect(html).toContain('id="search-count"');
+    expect(html).toContain('aria-live="polite"');
+    expect(html).toContain('role="status"');
+  });
+
+  it('adds a visually-hidden label for the search input', () => {
+    const html = generateReportHtml(minimalInput());
+    expect(html).toMatch(/<label[^>]*for="report-search"[^>]*class="visually-hidden"/);
+  });
+
+  it('emits a no-results row in each filterable section', () => {
+    const html = generateReportHtml(fullInput());
+    // Forms and API sections should each have a no-results row
+    const count = (html.match(/class="no-results"/g) || []).length;
+    expect(count).toBeGreaterThanOrEqual(2);
+  });
+
+  it('pre-computes data-search attribute on rows', () => {
+    const html = generateReportHtml(fullInput());
+    expect(html).toMatch(/data-search="[^"]*"/);
+  });
+
+  it('debounces search input with setTimeout', () => {
+    const html = generateReportHtml(minimalInput());
+    expect(html).toContain('setTimeout');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Structured filters (Fix G)
+// ---------------------------------------------------------------------------
+
+describe('structured filters', () => {
+  it('renders a method filter in the API section', () => {
+    const html = generateReportHtml(fullInput());
+    expect(html).toContain('id="api-method-filter"');
+    expect(html).toContain('data-filter-attr="api-method"');
+    expect(html).toContain('<option value="GET">GET</option>');
+    expect(html).toContain('<option value="POST">POST</option>');
+  });
+
+  it('renders a form type filter in the Forms section', () => {
+    const html = generateReportHtml(fullInput());
+    expect(html).toContain('id="form-type-filter"');
+    expect(html).toContain('data-filter-attr="form-type"');
+    expect(html).toContain('<option value="password">Has password</option>');
+  });
+
+  it('sets data-form-type=password on forms with password fields', () => {
+    const html = generateReportHtml(fullInput());
+    // The login form in fullInput() has a password field
+    expect(html).toMatch(/data-form-type="password"/);
+  });
+
+  it('sets data-api-method on each API row', () => {
+    const html = generateReportHtml(fullInput());
+    expect(html).toMatch(/data-api-method="GET"/);
+    expect(html).toMatch(/data-api-method="POST"/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Deep-linkable row IDs (Fix H)
+// ---------------------------------------------------------------------------
+
+describe('deep-linkable row IDs', () => {
+  it('adds form-N id to each form row', () => {
+    const html = generateReportHtml(fullInput());
+    expect(html).toContain('id="form-0"');
+    expect(html).toContain('id="form-1"');
+  });
+
+  it('adds api-<method>-<slug> id to each API row', () => {
+    const html = generateReportHtml(fullInput());
+    expect(html).toMatch(/id="api-get-[a-z0-9-]+"/);
+    expect(html).toMatch(/id="api-post-[a-z0-9-]+"/);
+  });
+
+  it('adds a permalink anchor on each row', () => {
+    const html = generateReportHtml(fullInput());
+    expect(html).toContain('class="row-permalink"');
+    expect(html).toContain('aria-label="Permalink to this form"');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Lightbox keyboard nav (Fix I)
+// ---------------------------------------------------------------------------
+
+describe('lightbox keyboard navigation', () => {
+  it('handles ArrowLeft and ArrowRight keys on the dialog', () => {
+    const html = generateReportHtml(fullInput());
+    expect(html).toContain('ArrowRight');
+    expect(html).toContain('ArrowLeft');
+  });
+
+  it('falls back to the search input when the originating card is filtered', () => {
+    const html = generateReportHtml(fullInput());
+    // Verify the close logic contains the fallback path
+    expect(html).toMatch(/searchInput\.focus\(\)/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Favicon + meta (Fix K)
+// ---------------------------------------------------------------------------
+
+describe('favicon and meta', () => {
+  it('includes a meta description with the target URL', () => {
+    const html = generateReportHtml(minimalInput());
+    expect(html).toMatch(/<meta name="description" content="Behavioral crawl report for/);
+  });
+
+  it('includes meta generator', () => {
+    const html = generateReportHtml(minimalInput());
+    expect(html).toContain('<meta name="generator" content="playwright-archaeologist">');
+  });
+
+  it('includes an inline SVG favicon data URI', () => {
+    const html = generateReportHtml(minimalInput());
+    expect(html).toMatch(/<link rel="icon" type="image\/svg\+xml" href="data:image\/svg\+xml/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Container width (Fix O)
+// ---------------------------------------------------------------------------
+
+describe('container width scaling', () => {
+  it('uses min(1600px, 95vw) for the container max-width', () => {
+    const html = generateReportHtml(minimalInput());
+    expect(html).toContain('max-width: min(1600px, 95vw)');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Absolute-path leak-proofing (Fix P)
+// ---------------------------------------------------------------------------
+
+describe('absolute path redaction in screenshots', () => {
+  it('redacts absolute paths outside outputDir to <file>', () => {
+    const input: ReportInput = {
+      ...minimalInput(),
+      outputDir: '/tmp/report-out',
+      screenshots: [
+        {
+          url: 'https://ex.com/',
+          thumbnailBase64: 'QUJD',
+          fullPath: 'C:\\Users\\someone\\somewhere\\img.png',
+        },
+      ],
+    };
+    const html = generateReportHtml(input);
+    // Should NOT contain the raw absolute path
+    expect(html).not.toContain('C:\\Users\\someone');
+    // Should redact to <file>
+    expect(html).toContain('&lt;file&gt;');
+  });
+
+  it('keeps paths that are already relative', () => {
+    const input: ReportInput = {
+      ...minimalInput(),
+      screenshots: [
+        {
+          url: 'https://ex.com/',
+          thumbnailBase64: 'QUJD',
+          fullPath: 'screenshots/home.png',
+        },
+      ],
+    };
+    const html = generateReportHtml(input);
+    expect(html).toContain('screenshots&#x2F;home.png');
   });
 });

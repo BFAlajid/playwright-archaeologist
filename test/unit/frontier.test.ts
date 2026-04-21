@@ -279,4 +279,61 @@ describe('Frontier', () => {
       expect(first?.url).toBe('https://example.com/page-0');
     });
   });
+
+  // -----------------------------------------------------------------------
+  // maxSeen bound
+  //
+  // A BFS with unbounded `seen` eats memory linearly with URL count. The
+  // frontier must fail loudly rather than OOM; callers can raise the cap
+  // when they genuinely need more.
+  // -----------------------------------------------------------------------
+
+  describe('maxSeen bound', () => {
+    it('throws FrontierOverflowError when seen-set exceeds the limit', () => {
+      const small = new Frontier({ maxSeen: 3 });
+
+      small.enqueue({ url: 'https://example.com/a', depth: 0 });
+      small.enqueue({ url: 'https://example.com/b', depth: 0 });
+      small.enqueue({ url: 'https://example.com/c', depth: 0 });
+
+      expect(() =>
+        small.enqueue({ url: 'https://example.com/d', depth: 0 }),
+      ).toThrow(/exceeded 3 URLs/);
+    });
+
+    it('exposes ERR_FRONTIER_OVERFLOW error code', () => {
+      const small = new Frontier({ maxSeen: 1 });
+      small.enqueue({ url: 'https://example.com/a', depth: 0 });
+
+      try {
+        small.enqueue({ url: 'https://example.com/b', depth: 0 });
+        expect.fail('enqueue should have thrown');
+      } catch (err: unknown) {
+        const e = err as { code?: string; name?: string };
+        expect(e.code).toBe('ERR_FRONTIER_OVERFLOW');
+        expect(e.name).toBe('FrontierOverflowError');
+      }
+    });
+
+    it('does not throw for duplicate URLs once the limit is reached', () => {
+      const small = new Frontier({ maxSeen: 2 });
+      small.enqueue({ url: 'https://example.com/a', depth: 0 });
+      small.enqueue({ url: 'https://example.com/b', depth: 0 });
+
+      // Re-enqueuing an already-seen URL is a no-op (returns false), not
+      // a new slot. It must NOT overflow.
+      expect(() =>
+        small.enqueue({ url: 'https://example.com/a', depth: 0 }),
+      ).not.toThrow();
+    });
+
+    it('defaults to a high bound that ordinary crawls do not hit', () => {
+      // 10k URLs is far below the default 500_000 cap — should succeed.
+      const large = new Frontier();
+      for (let i = 0; i < 10_000; i++) {
+        large.enqueue({ url: `https://example.com/p${i}`, depth: 0 });
+      }
+      expect(large.totalSeen).toBe(10_000);
+    });
+  });
 });

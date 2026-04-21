@@ -16,14 +16,59 @@ export interface NormalizeOptions {
   preserveHash?: boolean;
 }
 
+// ---------------------------------------------------------------------------
+// normalizeUrl memoization cache
+//
+// At 100k URLs the `new URL()` + searchParams sort + rebuild is seconds of
+// hot-path CPU. Frontier calls this on every enqueue AND every hasSeen —
+// and the same strings repeat constantly (nav bars, menus, pagination).
+//
+// We keep a size-capped Map keyed by raw `${url}|${preserveHash}`. Map
+// preserves insertion order, so we can evict the oldest entry when the cap
+// is exceeded (a pragmatic LRU approximation: on a hit we re-insert to
+// refresh recency).
+// ---------------------------------------------------------------------------
+
+const NORMALIZE_URL_CACHE_MAX = 10_000;
+const normalizeUrlCache = new Map<string, string>();
+
 /**
  * Normalize a URL for deduplication.
  * - Sorts query parameters alphabetically
  * - Removes trailing slashes (except root path)
  * - Strips hash fragments (unless preserveHash is true)
  * - Lowercases scheme and host
+ *
+ * Results are memoized in a bounded LRU cache keyed by `${url}|${preserveHash}`.
  */
 export function normalizeUrl(url: string, options: NormalizeOptions = {}): string {
+  const preserveHash = options.preserveHash === true;
+  const cacheKey = preserveHash ? `h|${url}` : url;
+
+  const cached = normalizeUrlCache.get(cacheKey);
+  if (cached !== undefined) {
+    // Refresh recency: delete + re-insert puts this key at the newest end
+    // of the Map's insertion-order iteration.
+    normalizeUrlCache.delete(cacheKey);
+    normalizeUrlCache.set(cacheKey, cached);
+    return cached;
+  }
+
+  const result = normalizeUrlImpl(url, preserveHash);
+
+  // Evict oldest if we'd exceed the cap. Map iteration order is insertion
+  // order, so the first key yielded is the oldest.
+  if (normalizeUrlCache.size >= NORMALIZE_URL_CACHE_MAX) {
+    const oldestKey = normalizeUrlCache.keys().next().value;
+    if (oldestKey !== undefined) {
+      normalizeUrlCache.delete(oldestKey);
+    }
+  }
+  normalizeUrlCache.set(cacheKey, result);
+  return result;
+}
+
+function normalizeUrlImpl(url: string, preserveHash: boolean): string {
   let parsed: URL;
   try {
     parsed = new URL(url);
@@ -52,7 +97,7 @@ export function normalizeUrl(url: string, options: NormalizeOptions = {}): strin
   }
 
   // Handle hash
-  if (!options.preserveHash) {
+  if (!preserveHash) {
     parsed.hash = '';
   }
 
@@ -65,6 +110,14 @@ export function normalizeUrl(url: string, options: NormalizeOptions = {}): strin
   parsed.pathname = pathname;
 
   return parsed.toString();
+}
+
+/**
+ * Test-only: clear the normalizeUrl memoization cache. Exposed so tests
+ * that inspect caching behavior can start from a known state.
+ */
+export function __clearNormalizeUrlCacheForTesting(): void {
+  normalizeUrlCache.clear();
 }
 
 /**

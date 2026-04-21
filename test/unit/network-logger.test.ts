@@ -851,4 +851,151 @@ describe('createNetworkLogger', () => {
     expect(result.responses[0].headers['x-api-key']).toBe('[REDACTED]');
     expect(result.responses[0].headers['content-type']).toBe('application/json');
   });
+
+  // -----------------------------------------------------------------------
+  // Response body gating by classification
+  //
+  // Performance: the body() IPC round-trip is the single most expensive
+  // operation in the response handler. We must skip it entirely for static
+  // assets, analytics, and WebSocket classifications — never just skip the
+  // buffer-to-text decode. Asset-heavy pages can have 100+ static requests;
+  // that many IPC round-trips is the hot path we are killing here.
+  // -----------------------------------------------------------------------
+
+  describe('response body gating by classification', () => {
+    it('skips body() IPC for static assets (images, fonts, CSS)', async () => {
+      const { page, emit } = createMockPage();
+      const logger = createNetworkLogger(page, PAGE_URL);
+      logger.start();
+
+      const request = createMockRequest({
+        url: 'https://example.com/logo.png',
+        resourceType: 'image',
+        headers: {},
+      });
+      emit('request', request);
+
+      const response = createMockResponse({
+        request,
+        headers: { 'content-type': 'image/png' },
+        body: 'binary-png-data',
+      });
+      emit('response', response);
+      await new Promise(resolve => setTimeout(resolve, 10));
+
+      const result = logger.stop();
+
+      // Body must NOT have been fetched — static classification short-circuits.
+      expect(response.body).not.toHaveBeenCalled();
+      // Classification recorded, but no body captured.
+      expect(result.requests[0].classification).toBe('static');
+      expect(result.responses[0].body).toBeUndefined();
+    });
+
+    it('skips body() IPC for analytics requests', async () => {
+      const { page, emit } = createMockPage();
+      const logger = createNetworkLogger(page, PAGE_URL);
+      logger.start();
+
+      const request = createMockRequest({
+        url: 'https://www.google-analytics.com/collect?v=1',
+        resourceType: 'other',
+        headers: {},
+      });
+      emit('request', request);
+
+      const response = createMockResponse({
+        request,
+        headers: { 'content-type': 'application/json' },
+        body: '{"track":true}',
+      });
+      emit('response', response);
+      await new Promise(resolve => setTimeout(resolve, 10));
+
+      const result = logger.stop();
+
+      expect(response.body).not.toHaveBeenCalled();
+      expect(result.requests[0].classification).toBe('analytics');
+      expect(result.responses[0].body).toBeUndefined();
+    });
+
+    it('always captures body for API requests', async () => {
+      const { page, emit } = createMockPage();
+      const logger = createNetworkLogger(page, PAGE_URL);
+      logger.start();
+
+      const request = createMockRequest({
+        url: 'https://example.com/api/users',
+        resourceType: 'fetch',
+        headers: {},
+      });
+      emit('request', request);
+
+      const response = createMockResponse({
+        request,
+        headers: { 'content-type': 'application/json' },
+        body: '{"id":1}',
+      });
+      emit('response', response);
+      await new Promise(resolve => setTimeout(resolve, 10));
+
+      const result = logger.stop();
+
+      expect(response.body).toHaveBeenCalled();
+      expect(result.requests[0].classification).toBe('api');
+      expect(result.responses[0].body).toBe('{"id":1}');
+    });
+
+    it('captures body for same-origin HTML documents (classified as "other")', async () => {
+      const { page, emit } = createMockPage();
+      const logger = createNetworkLogger(page, PAGE_URL);
+      logger.start();
+
+      const request = createMockRequest({
+        url: 'https://example.com/page',
+        resourceType: 'document',
+        headers: {},
+      });
+      emit('request', request);
+
+      const response = createMockResponse({
+        request,
+        headers: { 'content-type': 'text/html' },
+        body: '<html></html>',
+      });
+      emit('response', response);
+      await new Promise(resolve => setTimeout(resolve, 10));
+
+      const result = logger.stop();
+
+      expect(response.body).toHaveBeenCalled();
+      expect(result.responses[0].body).toBe('<html></html>');
+    });
+
+    it('still reports bodySize=0 for skipped bodies (no IPC, no size)', async () => {
+      const { page, emit } = createMockPage();
+      const logger = createNetworkLogger(page, PAGE_URL);
+      logger.start();
+
+      const request = createMockRequest({
+        url: 'https://example.com/assets/bg.jpg',
+        resourceType: 'image',
+        headers: {},
+      });
+      emit('request', request);
+
+      const response = createMockResponse({
+        request,
+        headers: { 'content-type': 'image/jpeg' },
+        body: 'abc',
+      });
+      emit('response', response);
+      await new Promise(resolve => setTimeout(resolve, 10));
+
+      const result = logger.stop();
+      // Body read was skipped so we cannot report a real size; zero is fine
+      // for the static-asset case where we never needed the body anyway.
+      expect(result.responses[0].bodySize).toBe(0);
+    });
+  });
 });

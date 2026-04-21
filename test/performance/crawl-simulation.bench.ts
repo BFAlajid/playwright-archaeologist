@@ -11,6 +11,12 @@
  * - Route tree builder throughput
  *
  * Run: npx vitest bench test/performance/crawl-simulation.bench.ts
+ *
+ * TODO: this bench measures an inlined fake (MockContextPool, simulatePageProcessing,
+ * a local parameterizePath copy) rather than the real modules from src/.
+ * Replace the inlined copies with real imports from src/crawl/context-pool.ts
+ * and src/assembler/api-grouper.ts before relying on budget enforcement.
+ * Frontier and normalizeUrl are already imported from src.
  */
 
 import { bench, describe } from 'vitest';

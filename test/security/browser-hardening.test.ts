@@ -18,13 +18,11 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 //   LAUNCH_OPTIONS: LaunchOptions
 //   getSecureContextOptions(overrides?: Partial<BrowserContextOptions>): BrowserContextOptions
 //   BLOCKED_RESOURCE_TYPES: string[]
-//   MAX_REDIRECTS: number
 //   registerPageSafetyHandlers(page: Page): void
 import {
   LAUNCH_OPTIONS,
   getSecureContextOptions,
   BLOCKED_RESOURCE_TYPES,
-  MAX_REDIRECTS,
   registerPageSafetyHandlers,
 } from '../../src/security/browser-hardening.js';
 
@@ -335,21 +333,6 @@ describe('Browser Hardening - Protocol Whitelist', () => {
     const opts = getSecureContextOptions();
     // Ensure no option allows file:// or other dangerous protocols
     expect((opts as any).allowFileAccess).not.toBe(true);
-  });
-});
-
-// ===========================================================================
-// 8. Redirect limit
-// ===========================================================================
-describe('Browser Hardening - Redirect Limit', () => {
-  it('defines a maximum redirect limit', () => {
-    expect(MAX_REDIRECTS).toBeDefined();
-    expect(typeof MAX_REDIRECTS).toBe('number');
-  });
-
-  it('redirect limit is reasonable (between 3 and 20)', () => {
-    expect(MAX_REDIRECTS).toBeGreaterThanOrEqual(3);
-    expect(MAX_REDIRECTS).toBeLessThanOrEqual(20);
   });
 });
 

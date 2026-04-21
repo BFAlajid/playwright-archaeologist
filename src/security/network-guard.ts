@@ -25,15 +25,48 @@ import { lookup } from 'node:dns/promises';
 
 export interface NetworkGuardOptions {
   allowPrivate?: boolean;
+  /**
+   * Per-session DNS cache shared across route handlers. The first time a
+   * hostname is resolved during `isBlockedUrl`, its IP is recorded here.
+   * On subsequent requests to the same hostname, `onRoute` re-resolves and
+   * blocks if the answer has changed — the hallmark of a DNS rebinding
+   * attack where the server initially answers with a public IP, then swaps
+   * to a private IP once the crawler is already talking to the host.
+   *
+   * Callers should create a fresh Map per crawl session and pass the same
+   * instance into `isBlockedUrl` and `createNetworkGuard`.
+   */
+  dnsCache?: Map<string, string>;
 }
 
 // -------------------------------------------------------------------------
 // Metadata hostnames
 // -------------------------------------------------------------------------
+// Cloud metadata service endpoints. These return credentials (IAM role
+// tokens, instance identity documents) to any HTTP client that can reach
+// them. They MUST be blocked whenever the crawl is running with network
+// access to the metadata network.
 const METADATA_HOSTNAMES = new Set([
+  // AWS / GCP / Azure legacy IMDS
   'metadata.google.internal',
   '169.254.169.254',
+  'fd00:ec2::254',         // AWS IMDS over IPv6
+  'fe80::a9fe:a9fe',       // AWS IMDS link-local v6
+  // Azure instance metadata
+  'metadata.azure.com',
+  // Alibaba / Tencent instance metadata
+  '100.100.100.200',
+  '100.100.200.200',
+  // Oracle OCI metadata
+  '192.0.0.192',
+  // Kubernetes service DNS
   'kubernetes.default.svc',
+]);
+
+// Absolute broadcast address — not link-local, not RFC1918, but not
+// something a crawler should ever contact.
+const BROADCAST_IPS = new Set<string>([
+  '255.255.255.255',
 ]);
 
 // -------------------------------------------------------------------------
@@ -296,6 +329,11 @@ export async function isBlockedUrl(
   // Remove brackets from IPv6
   const cleanedHost = decodedHostname.replace(/^\[|\]$/g, '');
 
+  // Broadcast addresses are never a legitimate crawl target.
+  if (BROADCAST_IPS.has(cleanedHost)) {
+    return { blocked: true, reason: `Blocked broadcast address: ${cleanedHost}` };
+  }
+
   // Check if hostname is directly a private IP (including encoded forms)
   if (isPrivateIp(cleanedHost)) {
     if (allowPrivate) return { blocked: false };
@@ -318,12 +356,26 @@ export async function isBlockedUrl(
     const result = await lookup(decodedHostname, { all: true });
     const addresses = Array.isArray(result) ? result : [result];
 
+    // Pick the first public address (or the first address if allowPrivate).
+    // This becomes the pinned answer for this hostname for the rest of
+    // the session.
+    let pinned: string | undefined;
     for (const entry of addresses) {
       const addr = typeof entry === 'string' ? entry : entry.address;
       if (isPrivateIp(addr)) {
-        if (allowPrivate) return { blocked: false };
+        if (allowPrivate) {
+          pinned = pinned ?? addr;
+          continue;
+        }
         return { blocked: true, reason: `DNS resolved to private IP: ${addr}` };
       }
+      pinned = pinned ?? addr;
+    }
+
+    // Record the pinned IP for later rebinding detection. Only set on the
+    // first resolution — later requests compare against this entry.
+    if (pinned && options?.dnsCache && !options.dnsCache.has(decodedHostname)) {
+      options.dnsCache.set(decodedHostname, pinned);
     }
 
     return { blocked: false };
@@ -335,6 +387,21 @@ export async function isBlockedUrl(
 
 /**
  * Create a Playwright route handler that blocks requests to private IPs.
+ *
+ * Also performs best-effort DNS rebinding detection when `options.dnsCache`
+ * is provided. Each request re-resolves the hostname and compares against
+ * the pinned address set on first resolution. If none of the fresh
+ * addresses match the pinned one AND at least one fresh address is private,
+ * the request is blocked (classic rebinding to a private target). If all
+ * fresh addresses are public but different, this is more likely ordinary
+ * DNS rotation (round-robin, A/AAAA load balancing) — the request is
+ * allowed but we record the observation.
+ *
+ * CAVEAT: this check does not cover the time-of-check-to-time-of-use window
+ * between our resolver and Playwright's own TCP connect; for a hard
+ * guarantee you would need to pin at the socket level (e.g. a custom HTTP
+ * agent that forces connection to the pinned address with the original
+ * hostname in the Host header). That is out of scope here.
  */
 export function createNetworkGuard(options?: NetworkGuardOptions) {
   return async (route: any) => {
@@ -343,8 +410,37 @@ export function createNetworkGuard(options?: NetworkGuardOptions) {
 
     if (result.blocked) {
       await route.abort('blockedbyclient');
-    } else {
-      await route.continue();
+      return;
     }
+
+    if (options?.dnsCache) {
+      try {
+        const hostname = new URL(url).hostname.replace(/^\[|\]$/g, '');
+        const pinned = options.dnsCache.get(hostname);
+        if (pinned) {
+          const fresh = await lookup(hostname, { all: true });
+          const addresses = Array.isArray(fresh) ? fresh : [fresh];
+          const freshAddrs = addresses.map((a) =>
+            typeof a === 'string' ? a : a.address,
+          );
+          const matches = freshAddrs.includes(pinned);
+          if (!matches) {
+            const anyPrivate = freshAddrs.some((a) => isPrivateIp(a));
+            if (anyPrivate && !(options.allowPrivate ?? false)) {
+              // Classic rebinding attempt: resolver now returns a private IP.
+              await route.abort('blockedbyclient');
+              return;
+            }
+            // Public IP rotation (CDN round-robin / geo-LB). Allow.
+          }
+        }
+      } catch {
+        // DNS errored on re-lookup — fail closed.
+        await route.abort('blockedbyclient');
+        return;
+      }
+    }
+
+    await route.continue();
   };
 }

@@ -139,11 +139,11 @@ describe('executeAuth -- storage state', () => {
       .mockRejectedValueOnce(new Error('ENOENT'))  // storageStatePath check
       .mockResolvedValueOnce(undefined);            // authScript check
 
-    // Mock dynamic import for auth script
+    // Mock dynamic import for auth script. `vi.doMock` takes (specifier, factory) —
+    // the 3rd `{ virtual: true }` arg is a vi.mock-specific API that does not exist
+    // on doMock (TS2554) and was silently ignored at runtime. Dropped.
     const authFn = vi.fn().mockResolvedValue(undefined);
-    vi.doMock('/absolute/auth-script.js', () => ({ default: authFn }), {
-      virtual: true,
-    });
+    vi.doMock('/absolute/auth-script.js', () => ({ default: authFn }));
 
     // The import() in runAuthScript uses resolve() which will produce an absolute path.
     // We need to handle this differently -- the auth handler uses import() directly.
@@ -253,7 +253,9 @@ describe('executeAuth -- auth script', () => {
 
     expect(result.success).toBe(false);
     expect(result.method).toBe('script');
-    expect(result.error).toContain('failed validation');
+    // The new security path rejects the script with a SecurityError whose
+    // message contains "failed static analysis" and lists each finding.
+    expect(result.error).toContain('failed static analysis');
     expect(result.error).toContain('child_process');
     expect(mockValidateAuthScript).toHaveBeenCalled();
   });

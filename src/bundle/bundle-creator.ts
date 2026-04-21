@@ -23,10 +23,69 @@ import {
   rename,
   rm,
 } from 'node:fs/promises';
-import { join, basename, extname, relative } from 'node:path';
+import { join, basename, extname, relative, resolve, isAbsolute, sep } from 'node:path';
 import type { BundleManifest, BundleFileEntry } from '../types/artifacts.js';
 import { BundleError } from '../types/errors.js';
 import { TOOL_VERSION } from '../security/browser-hardening.js';
+
+/**
+ * Return true iff `p` is a relative path that, when resolved against
+ * `bundleRoot`, lies strictly under that root. Rejects:
+ *   - `..` segments (classic traversal)
+ *   - leading `/` (POSIX absolute)
+ *   - Windows drive letters like `C:` or `c:/`
+ *   - UNC-style `\\server\share\...`
+ *   - percent-encoded traversal that decodes to `..`
+ *
+ * Used to vet every `path` in bundle manifests before the tool reads the
+ * file — a malicious bundle otherwise lets an attacker read arbitrary
+ * files on the machine running the diff.
+ */
+export function isSafeBundlePath(p: string, bundleRoot: string): boolean {
+  if (typeof p !== 'string' || p.length === 0) return false;
+
+  // Reject any control character (including NUL). A leading NUL would otherwise
+  // bypass segment checks: `\x00..` is a distinct segment from `..`, but most
+  // filesystems either reject NUL outright or treat it as a string terminator.
+  if (/[\x00-\x1f]/.test(p)) return false;
+
+  // Reject UNC prefix outright. The logic below expects a local relative path.
+  if (p.startsWith('\\\\') || p.startsWith('//')) return false;
+
+  // Normalize slashes for traversal-segment inspection.
+  const normalized = p.replace(/\\/g, '/');
+
+  // Disallow any `..` segment. Checking segment-by-segment is safer than
+  // just string-containing `..` — that false-positives on e.g. `..foo`.
+  const segments = normalized.split('/');
+  if (segments.some((s) => s === '..')) return false;
+
+  // Disallow percent-encoded traversal (%2e%2e, %2E%2E, etc.).
+  try {
+    const decoded = decodeURIComponent(normalized);
+    const decodedSegments = decoded.split('/');
+    if (decodedSegments.some((s) => s === '..')) return false;
+  } catch {
+    // Malformed percent-encoding → reject conservatively.
+    return false;
+  }
+
+  // Reject absolute paths of any flavour.
+  if (isAbsolute(p)) return false;
+  if (normalized.startsWith('/')) return false;
+  if (/^[A-Za-z]:[\\/]/.test(p)) return false;
+
+  // Final safety check: after resolve() against the root, the result must
+  // still be inside the root. Guards against any normalization corner
+  // case the string checks above might miss.
+  const resolvedRoot = resolve(bundleRoot);
+  const resolvedPath = resolve(bundleRoot, p);
+  return (
+    resolvedPath === resolvedRoot ||
+    resolvedPath.startsWith(resolvedRoot + sep) ||
+    resolvedPath.startsWith(resolvedRoot + '/')
+  );
+}
 
 /** File extensions mapped to bundle file types. */
 function classifyFile(filePath: string): BundleFileEntry['type'] | null {

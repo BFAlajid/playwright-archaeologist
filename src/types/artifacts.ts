@@ -386,6 +386,20 @@ export interface PageVisitResult {
     message: string;
   }>;
 
+  /**
+   * Output of registered Collector plugins keyed by collector name. Keys
+   * map 1:1 to the `name` on each `Collector` in the registry. Missing
+   * keys mean the plugin either was not registered or failed (in which
+   * case a string error appears in `pluginErrors`).
+   */
+  pluginData?: Record<string, unknown>;
+
+  /**
+   * Per-plugin errors. Unlike `collectorErrors` (built-in collectors)
+   * these come from user-registered Collector plugins.
+   */
+  pluginErrors?: Array<{ collector: string; message: string }>;
+
   /** Navigation edges discovered from this page. */
   navigationEdges: NavigationEdge[];
 }
@@ -738,8 +752,24 @@ export interface BundleFileEntry {
 export interface DiffResult {
   /** Metadata about the comparison. */
   meta: {
-    oldBundle: { path: string; createdAt: string; targetUrl: string; toolVersion: string };
-    newBundle: { path: string; createdAt: string; targetUrl: string; toolVersion: string };
+    /**
+     * `reportUrl` is optional — when present, the diff report will link
+     * each row back to the corresponding entry in that bundle's main report.
+     */
+    oldBundle: {
+      path: string;
+      createdAt: string;
+      targetUrl: string;
+      toolVersion: string;
+      reportUrl?: string;
+    };
+    newBundle: {
+      path: string;
+      createdAt: string;
+      targetUrl: string;
+      toolVersion: string;
+      reportUrl?: string;
+    };
     comparedAt: string;
   };
   /** Overall change status. */
@@ -867,6 +897,12 @@ export interface ScreenshotChange {
   totalPixels: number;
   /** Path to the diff image (red overlay on semi-transparent original). */
   diffImagePath: string;
+  /**
+   * Path to the heatmap PNG produced by pixelmatch (highlights changed
+   * pixels in red). Only populated when the pixel-diff path ran; falls
+   * back to an empty string / undefined for the hash-only code path.
+   */
+  heatmapPath?: string;
   /** Path to the old screenshot. */
   oldScreenshotPath: string;
   /** Path to the new screenshot. */
@@ -876,6 +912,12 @@ export interface ScreenshotChange {
     old: { width: number; height: number };
     new: { width: number; height: number };
   };
+  /**
+   * Human-readable reason the pixel diff could not run (e.g. "dimension
+   * mismatch"). Present only when `diffPercentage` could not be
+   * computed accurately.
+   */
+  diffUnavailableReason?: string;
 }
 
 // ===========================================================================

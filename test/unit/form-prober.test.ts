@@ -4,19 +4,23 @@
  * Tests the probeForms function with mocked Playwright Page objects.
  * Verifies form extraction, field metadata, select options, submit buttons,
  * URL resolution, password redaction, and implicit form detection.
+ *
+ * Implementation note: the prober runs ONE page.evaluate() per page that
+ * returns both explicit and implicit forms in a single roundtrip. Tests
+ * mock page.evaluate directly and feed it a list of RawFormData objects.
  */
 
 import { describe, it, expect, vi } from 'vitest';
 import { probeForms } from '../../src/collectors/form-prober.js';
-import type { Page, Locator } from 'playwright';
+import type { Page } from 'playwright';
 
 // ---------------------------------------------------------------------------
 // Mock helpers
 // ---------------------------------------------------------------------------
 
 /**
- * Raw form data shape returned by formLocator.evaluate().
- * Matches the RawFormData interface inside form-prober.ts.
+ * Raw form data shape returned by the in-browser extractor.
+ * Matches RawFormData inside form-prober.ts.
  */
 interface MockRawFormData {
   action: string;
@@ -43,6 +47,7 @@ interface MockRawFormData {
     isPassword: boolean;
   }>;
   submitButtonText: string | null;
+  isImplicit: boolean;
 }
 
 function makeRawFormData(
@@ -57,6 +62,7 @@ function makeRawFormData(
     ariaLabel: null,
     fields: [],
     submitButtonText: null,
+    isImplicit: false,
     ...overrides,
   };
 }
@@ -85,31 +91,24 @@ function makeRawField(
 }
 
 /**
- * Create a mock Locator that returns a given raw form data from evaluate().
- */
-function createMockLocator(rawFormData: MockRawFormData): Locator {
-  return {
-    evaluate: vi.fn(async () => rawFormData),
-  } as unknown as Locator;
-}
-
-/**
- * Create a minimal mock Page for form probing.
- *
- * @param formLocators   Array of mock locators (one per explicit form)
- * @param implicitForms  Result of page.evaluate for implicit form detection
+ * Create a minimal mock Page for form probing. The page.evaluate call
+ * resolves with the provided raw form list. A pre-supplied error (via
+ * `evaluateThrows`) makes the evaluate call reject for graceful-failure
+ * coverage.
  */
 function createMockPage(options: {
-  formLocators?: Locator[];
-  implicitFormsResult?: MockRawFormData[];
+  forms?: MockRawFormData[];
+  evaluateThrows?: boolean;
 }): Page {
-  const { formLocators = [], implicitFormsResult = [] } = options;
+  const { forms = [], evaluateThrows = false } = options;
 
   return {
-    locator: vi.fn(() => ({
-      all: vi.fn(async () => formLocators),
-    })),
-    evaluate: vi.fn(async () => implicitFormsResult),
+    evaluate: vi.fn(async () => {
+      if (evaluateThrows) {
+        throw new Error('page crashed');
+      }
+      return forms;
+    }),
   } as unknown as Page;
 }
 
@@ -126,9 +125,7 @@ describe('probeForms', () => {
       name: 'login',
     });
 
-    const page = createMockPage({
-      formLocators: [createMockLocator(formData)],
-    });
+    const page = createMockPage({ forms: [formData] });
 
     const result = await probeForms(page, 'https://example.com/');
 
@@ -141,7 +138,7 @@ describe('probeForms', () => {
     expect(result.forms[0].isImplicit).toBe(false);
   });
 
-  it('extracts multiple forms from one page', async () => {
+  it('extracts multiple forms from one page in a SINGLE evaluate call', async () => {
     const form1 = makeRawFormData({
       action: 'https://example.com/search',
       method: 'GET',
@@ -153,15 +150,18 @@ describe('probeForms', () => {
       id: 'login-form',
     });
 
-    const page = createMockPage({
-      formLocators: [createMockLocator(form1), createMockLocator(form2)],
-    });
+    const page = createMockPage({ forms: [form1, form2] });
 
     const result = await probeForms(page, 'https://example.com/');
 
     expect(result.forms).toHaveLength(2);
     expect(result.forms[0].id).toBe('search-form');
     expect(result.forms[1].id).toBe('login-form');
+
+    // Critical performance invariant: ONE evaluate call regardless of form
+    // count. Previously this was N+1 IPC roundtrips per page.
+    const evaluateMock = page.evaluate as ReturnType<typeof vi.fn>;
+    expect(evaluateMock).toHaveBeenCalledTimes(1);
   });
 
   // ---------------------------------------------------------------------------
@@ -199,9 +199,7 @@ describe('probeForms', () => {
       ],
     });
 
-    const page = createMockPage({
-      formLocators: [createMockLocator(formData)],
-    });
+    const page = createMockPage({ forms: [formData] });
 
     const result = await probeForms(page, 'https://example.com/');
     const fields = result.forms[0].fields;
@@ -246,9 +244,7 @@ describe('probeForms', () => {
       ],
     });
 
-    const page = createMockPage({
-      formLocators: [createMockLocator(formData)],
-    });
+    const page = createMockPage({ forms: [formData] });
 
     const result = await probeForms(page, 'https://example.com/');
     const field = result.forms[0].fields[0];
@@ -278,9 +274,7 @@ describe('probeForms', () => {
       submitButtonText: 'Sign In',
     });
 
-    const page = createMockPage({
-      formLocators: [createMockLocator(formData)],
-    });
+    const page = createMockPage({ forms: [formData] });
 
     const result = await probeForms(page, 'https://example.com/');
 
@@ -294,9 +288,7 @@ describe('probeForms', () => {
       submitButtonText: null,
     });
 
-    const page = createMockPage({
-      formLocators: [createMockLocator(formData)],
-    });
+    const page = createMockPage({ forms: [formData] });
 
     const result = await probeForms(page, 'https://example.com/');
 
@@ -313,14 +305,12 @@ describe('probeForms', () => {
       method: 'POST',
     });
 
-    const page = createMockPage({
-      formLocators: [createMockLocator(formData)],
-    });
+    const page = createMockPage({ forms: [formData] });
 
     const result = await probeForms(page, 'https://example.com/forms/contact');
 
-    // The evaluate function inside the browser resolves URLs, so the mock
-    // returns the already-resolved URL.
+    // The browser-side extractor resolves URLs, so the mock returns the
+    // already-resolved absolute URL.
     expect(result.forms[0].action).toBe('https://example.com/api/submit');
   });
 
@@ -334,9 +324,7 @@ describe('probeForms', () => {
       method: 'POST',
     });
 
-    const page = createMockPage({
-      formLocators: [createMockLocator(formData)],
-    });
+    const page = createMockPage({ forms: [formData] });
 
     const result = await probeForms(page, 'https://example.com/');
 
@@ -367,9 +355,7 @@ describe('probeForms', () => {
       ],
     });
 
-    const page = createMockPage({
-      formLocators: [createMockLocator(formData)],
-    });
+    const page = createMockPage({ forms: [formData] });
 
     const result = await probeForms(page, 'https://example.com/');
     const fields = result.forms[0].fields;
@@ -392,9 +378,7 @@ describe('probeForms', () => {
       ],
     });
 
-    const page = createMockPage({
-      formLocators: [createMockLocator(formData)],
-    });
+    const page = createMockPage({ forms: [formData] });
 
     const result = await probeForms(page, 'https://example.com/');
 
@@ -417,12 +401,10 @@ describe('probeForms', () => {
         }),
       ],
       submitButtonText: 'Go',
+      isImplicit: true,
     });
 
-    const page = createMockPage({
-      formLocators: [], // no explicit forms
-      implicitFormsResult: [implicitForm],
-    });
+    const page = createMockPage({ forms: [implicitForm] });
 
     const result = await probeForms(page, 'https://example.com/');
 
@@ -438,6 +420,7 @@ describe('probeForms', () => {
       action: 'https://example.com/login',
       method: 'POST',
       id: 'login',
+      isImplicit: false,
     });
 
     const implicitForm = makeRawFormData({
@@ -449,12 +432,10 @@ describe('probeForms', () => {
           type: 'text',
         }),
       ],
+      isImplicit: true,
     });
 
-    const page = createMockPage({
-      formLocators: [createMockLocator(explicitForm)],
-      implicitFormsResult: [implicitForm],
-    });
+    const page = createMockPage({ forms: [explicitForm, implicitForm] });
 
     const result = await probeForms(page, 'https://example.com/');
 
@@ -469,10 +450,7 @@ describe('probeForms', () => {
   // ---------------------------------------------------------------------------
 
   it('handles page with no forms (returns empty array)', async () => {
-    const page = createMockPage({
-      formLocators: [],
-      implicitFormsResult: [],
-    });
+    const page = createMockPage({ forms: [] });
 
     const result = await probeForms(page, 'https://example.com/');
 
@@ -492,9 +470,7 @@ describe('probeForms', () => {
       ariaLabel: 'File upload form',
     });
 
-    const page = createMockPage({
-      formLocators: [createMockLocator(formData)],
-    });
+    const page = createMockPage({ forms: [formData] });
 
     const result = await probeForms(page, 'https://example.com/');
 
@@ -508,9 +484,7 @@ describe('probeForms', () => {
       method: 'GET',
     });
 
-    const page = createMockPage({
-      formLocators: [createMockLocator(formData)],
-    });
+    const page = createMockPage({ forms: [formData] });
 
     const result = await probeForms(page, 'https://example.com/');
 
@@ -537,9 +511,7 @@ describe('probeForms', () => {
       ],
     });
 
-    const page = createMockPage({
-      formLocators: [createMockLocator(formData)],
-    });
+    const page = createMockPage({ forms: [formData] });
 
     const result = await probeForms(page, 'https://example.com/');
     const field = result.forms[0].fields[0];
@@ -559,9 +531,7 @@ describe('probeForms', () => {
       method: 'POST',
     });
 
-    const page = createMockPage({
-      formLocators: [createMockLocator(formData)],
-    });
+    const page = createMockPage({ forms: [formData] });
 
     const result = await probeForms(page, 'https://example.com/');
 
@@ -573,38 +543,8 @@ describe('probeForms', () => {
   // Error handling / graceful degradation
   // ---------------------------------------------------------------------------
 
-  it('skips a form that throws during extraction', async () => {
-    const failingLocator = {
-      evaluate: vi.fn(async () => {
-        throw new Error('element detached');
-      }),
-    } as unknown as Locator;
-
-    const goodForm = makeRawFormData({
-      action: 'https://example.com/ok',
-      method: 'GET',
-      id: 'good-form',
-    });
-
-    const page = createMockPage({
-      formLocators: [failingLocator, createMockLocator(goodForm)],
-    });
-
-    const result = await probeForms(page, 'https://example.com/');
-
-    expect(result.forms).toHaveLength(1);
-    expect(result.forms[0].id).toBe('good-form');
-  });
-
-  it('returns empty forms when implicit form detection throws', async () => {
-    const page = {
-      locator: vi.fn(() => ({
-        all: vi.fn(async () => []),
-      })),
-      evaluate: vi.fn(async () => {
-        throw new Error('page crashed');
-      }),
-    } as unknown as Page;
+  it('returns empty forms when evaluate throws', async () => {
+    const page = createMockPage({ evaluateThrows: true });
 
     const result = await probeForms(page, 'https://example.com/');
 
@@ -628,9 +568,7 @@ describe('probeForms', () => {
       ],
     });
 
-    const page = createMockPage({
-      formLocators: [createMockLocator(formData)],
-    });
+    const page = createMockPage({ forms: [formData] });
 
     const result = await probeForms(page, 'https://example.com/');
 
@@ -647,9 +585,7 @@ describe('probeForms', () => {
       method: 'GET',
     });
 
-    const page = createMockPage({
-      formLocators: [createMockLocator(formData)],
-    });
+    const page = createMockPage({ forms: [formData] });
 
     const result = await probeForms(page, 'https://example.com/');
 

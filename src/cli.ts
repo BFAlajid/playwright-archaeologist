@@ -23,6 +23,8 @@ import { dig } from './crawl/orchestrator.js';
 import { diffBundles } from './diff/diff-engine.js';
 import { generateDiffReportHtml } from './diff/diff-report.js';
 import { createBundle } from './bundle/bundle-creator.js';
+import { AxeCollector } from './plugins/axe-collector.js';
+import type { Collector } from './plugins/types.js';
 
 // ---------------------------------------------------------------------------
 // Load package.json for version
@@ -123,18 +125,44 @@ program
   .option('-o, --output <dir>', 'Output directory (default: .archaeologist)')
   .option('-f, --format <fmt>', 'Output format: html, json, openapi, both (default: both)')
   .option('--no-screenshots', 'Skip screenshot capture')
+  .option('--screenshot-format <fmt>', 'Screenshot format for full-page: jpeg|png (default: jpeg)')
   .option('--no-har', 'Skip HAR recording')
+  .option('--pretty', 'Pretty-print JSON artifacts (default: minified)', false)
 
   // -- Display options --
   .option('--viewport <WxH>', 'Primary viewport dimensions (default: 1280x720)')
   .option('--viewports <list>', 'Additional viewports for responsive screenshots (comma-separated, e.g. 375x667,768x1024)')
 
   // -- Resume options --
-  .option('--resume', 'Resume from last checkpoint in the output directory', false)
+  // TODO: restore --resume once src/crawl/checkpoint.ts is wired into the orchestrator.
+  // The module exists (writeCheckpoint/readCheckpoint/setupAutoCheckpoint) but is not
+  // currently invoked, so advertising the flag would be vaporware.
   .option('-y, --yes', 'Skip confirmation prompts', false)
 
   // -- Security options --
   .option('--allow-private', 'Allow crawling private/internal IP ranges', false)
+  .option(
+    '--allow-auth-script',
+    'Allow running auth scripts that fail static analysis (imports fs, child_process, uses eval, etc.)',
+    false,
+  )
+  .option(
+    '--har-include-bodies',
+    'Include response bodies in HAR output (bodies are redacted, but may contain hard-to-detect secrets)',
+    false,
+  )
+  .option(
+    '--capture-js-bodies',
+    'Capture JavaScript response bodies in the network log (may contain hardcoded keys)',
+    false,
+  )
+
+  // -- Accessibility --
+  .option(
+    '--with-a11y',
+    'Run an axe-core accessibility audit on each visited page and emit accessibility.json',
+    false,
+  )
 
   // -- Debug options --
   .option('-v, --verbose', 'Enable debug logging', false)
@@ -234,12 +262,16 @@ program
       if (typeof opts.format === 'string') rawConfig.format = opts.format;
       // Commander uses --no-screenshots to set opts.screenshots = false
       if (opts.screenshots === false) rawConfig.noScreenshots = true;
+      if (typeof opts.screenshotFormat === 'string') rawConfig.screenshotFormat = opts.screenshotFormat;
       if (opts.har === false) rawConfig.noHar = true;
+      if (opts.pretty) rawConfig.prettyJson = true;
       if (viewport) rawConfig.viewport = viewport;
       if (additionalViewports) rawConfig.additionalViewports = additionalViewports;
-      if (opts.resume) rawConfig.resume = true;
       if (opts.yes) rawConfig.yes = true;
       if (opts.allowPrivate) rawConfig.allowPrivate = true;
+      if (opts.allowAuthScript) rawConfig.allowAuthScript = true;
+      if (opts.harIncludeBodies) rawConfig.harIncludeBodies = true;
+      if (opts.captureJsBodies) rawConfig.captureJsBodies = true;
 
       // --- Validate with Zod ---
       const parseResult = CrawlConfigSchema.safeParse(rawConfig);
@@ -259,6 +291,14 @@ program
 
       const validatedConfig = parseResult.data;
 
+      // --- Build the collector plugin list from CLI flags ---
+      // Only vetted, in-tree collectors are bundled here — arbitrary user
+      // plugins are a programmatic-API concern.
+      const cliCollectors: Collector[] = [];
+      if (opts.withA11y) {
+        cliCollectors.push(new AxeCollector());
+      }
+
       // --- Build ResolvedConfig ---
       const resolvedConfig: ResolvedConfig = {
         ...validatedConfig,
@@ -266,6 +306,7 @@ program
         authScript: validatedConfig.authScript ? resolve(validatedConfig.authScript) : undefined,
         cookiesFile: validatedConfig.cookiesFile ? resolve(validatedConfig.cookiesFile) : undefined,
         warnings,
+        collectors: cliCollectors.length > 0 ? cliCollectors : undefined,
       };
 
       logger.debug('Resolved config: %o', resolvedConfig);
@@ -403,8 +444,26 @@ program
 
       logger.info(`Comparing bundles:\n  old: ${oldPath}\n  new: ${newPath}`);
 
+      // Choose a directory for pixel-diff heatmaps. Prefer the user's
+      // --output target (so `file://` links resolve from the same dir as
+      // the generated diff report). If no --output is given and the HTML
+      // report goes to a specific file, place heatmaps alongside it.
+      // Otherwise skip heatmap emission.
+      let heatmapDir: string | undefined;
+      if (typeof opts.output === 'string') {
+        heatmapDir = resolve(opts.output as string, 'heatmaps');
+      } else if (typeof opts.formatHtml === 'string') {
+        heatmapDir = resolve(dirname(resolve(opts.formatHtml)), 'heatmaps');
+      }
+
       // Run diff engine
-      const diffResult = await diffBundles(oldPath, newPath);
+      const validatedDiff = parseResult.data;
+      const diffResult = await diffBundles(oldPath, newPath, {
+        diffThreshold: validatedDiff.diffThreshold,
+        diffMaxRatio: validatedDiff.diffMaxRatio,
+        diffIgnoreFields: validatedDiff.diffIgnoreFields,
+        heatmapDir,
+      });
 
       // Terminal summary
       const s = diffResult.summary;

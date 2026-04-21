@@ -7,11 +7,13 @@
  */
 
 import { describe, it, expect } from 'vitest';
+import * as path from 'node:path';
 import {
   CrawlConfigSchema,
   ViewportSchema,
   parseViewport,
   normalizeEntryUrl,
+  resolveConfig,
 } from '../../src/types/config.js';
 
 // ---------------------------------------------------------------------------
@@ -374,5 +376,65 @@ describe('normalizeEntryUrl', () => {
 
   it('rejects URL with no hostname', () => {
     expect(() => normalizeEntryUrl('https://')).toThrow();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// resolveConfig
+// ---------------------------------------------------------------------------
+
+describe('resolveConfig', () => {
+  it('produces a ResolvedConfig with absolute outputDir and empty warnings', () => {
+    const result = resolveConfig({
+      targetUrl: 'https://example.com',
+      outputDir: './out',
+    });
+
+    expect(result.targetUrl).toBe('https://example.com');
+    expect(path.isAbsolute(result.outputDir)).toBe(true);
+    expect(result.outputDir.endsWith('out')).toBe(true);
+    expect(result.warnings).toEqual([]);
+  });
+
+  it('applies all schema defaults', () => {
+    const result = resolveConfig({ targetUrl: 'https://example.com' });
+
+    expect(result.depth).toBe(5);
+    expect(result.maxPages).toBe(1000);
+    expect(result.concurrency).toBe(3);
+    expect(result.viewport).toEqual({ width: 1280, height: 720 });
+    expect(result.format).toBe('both');
+    expect(result.prettyJson).toBe(false);
+  });
+
+  it('captures URL normalization warnings', () => {
+    const result = resolveConfig({ targetUrl: 'example.com' });
+    expect(result.targetUrl).toBe('https://example.com');
+    expect(result.warnings.length).toBeGreaterThan(0);
+    expect(result.warnings[0]).toContain('No protocol');
+  });
+
+  it('resolves authScript and cookiesFile to absolute paths', () => {
+    const result = resolveConfig({
+      targetUrl: 'https://example.com',
+      authScript: './auth.js',
+      cookiesFile: './cookies.json',
+    });
+
+    expect(path.isAbsolute(result.authScript!)).toBe(true);
+    expect(path.isAbsolute(result.cookiesFile!)).toBe(true);
+  });
+
+  it('throws when validation fails', () => {
+    expect(() =>
+      resolveConfig({
+        targetUrl: 'https://example.com',
+        depth: -1,
+      }),
+    ).toThrow(/depth/);
+  });
+
+  it('throws for invalid URL', () => {
+    expect(() => resolveConfig({ targetUrl: 'ftp://example.com' })).toThrow();
   });
 });

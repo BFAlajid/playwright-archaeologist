@@ -22,6 +22,9 @@ import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import * as os from 'node:os';
 import type { ResolvedConfig } from '../../src/types/config.js';
+import type { PageVisitResult } from '../../src/types/artifacts.js';
+import { buildRouteTree } from '../../src/crawl/orchestrator.js';
+import { hasChromium } from '../helpers/has-chromium.js';
 
 // We test the module by importing it — the actual browser interactions
 // are tested in integration tests. These unit tests focus on:
@@ -46,22 +49,24 @@ function makeConfig(overrides: Partial<ResolvedConfig> = {}): ResolvedConfig {
     outputDir: '',
     format: 'both',
     noScreenshots: false,
+    screenshotFormat: 'jpeg',
     noHar: true, // Skip HAR for unit tests
     viewport: { width: 1280, height: 720 },
     additionalViewports: [],
     resume: false,
     yes: false,
     allowPrivate: true, // Allow private IPs in tests
-    diffThreshold: 0.1,
-    diffMaxRatio: 0.5,
-    diffIgnoreFields: [],
+    allowAuthScript: false,
+    captureJsBodies: false,
+    harIncludeBodies: false,
+    prettyJson: false,
     includeCookies: false,
     warnings: [],
     ...overrides,
   };
 }
 
-describe('Orchestrator', () => {
+describe.skipIf(!hasChromium)('Orchestrator', () => {
   let tmpDir: string;
 
   beforeEach(async () => {
@@ -81,15 +86,8 @@ describe('Orchestrator', () => {
       const { dig } = await import('../../src/crawl/orchestrator.js');
       const config = makeConfig({ outputDir: tmpDir, maxPages: 1, depth: 0 });
 
-      // This will attempt a real browser launch. If Playwright is not installed,
-      // the test verifies error handling. If installed, it runs the real crawl.
-      let result;
-      try {
-        result = await dig(config);
-      } catch {
-        // Browser not available — skip this test.
-        return;
-      }
+      // Chromium is present (gated by describe.skipIf). Errors are real failures.
+      const result = await dig(config);
 
       // Validate DigResult shape.
       expect(result).toBeDefined();
@@ -128,11 +126,9 @@ describe('Orchestrator', () => {
       const nestedDir = path.join(tmpDir, 'a', 'b', 'c');
       const config = makeConfig({ outputDir: nestedDir, maxPages: 1, depth: 0 });
 
-      try {
-        await dig(config);
-      } catch {
-        // Browser may not be available.
-      }
+      // dig() may return a DigResult with status 'error' if the target URL
+      // is unreachable — but it must create the output dir regardless.
+      await dig(config);
 
       const stat = await fs.stat(nestedDir).catch(() => null);
       expect(stat?.isDirectory()).toBe(true);
@@ -148,12 +144,8 @@ describe('Orchestrator', () => {
       const { dig } = await import('../../src/crawl/orchestrator.js');
       const config = makeConfig({ outputDir: tmpDir, maxPages: 1, depth: 0 });
 
-      let result;
-      try {
-        result = await dig(config);
-      } catch {
-        return; // Browser not available.
-      }
+      const result = await dig(config);
+      expect(result).toBeDefined();
 
       // Check sitemap.json exists.
       const sitemapPath = path.join(tmpDir, 'sitemap.json');
@@ -207,7 +199,7 @@ describe('Orchestrator', () => {
 // their behavior through the public dig() API above)
 // ---------------------------------------------------------------------------
 
-describe('Orchestrator internal behavior', () => {
+describe.skipIf(!hasChromium)('Orchestrator internal behavior', () => {
   describe('frontier integration', () => {
     it('respects maxPages limit', async () => {
       // This is validated through the dig() function behavior.
@@ -217,12 +209,7 @@ describe('Orchestrator internal behavior', () => {
 
       try {
         const config = makeConfig({ outputDir: tmpDir, maxPages: 1, depth: 5 });
-        let result;
-        try {
-          result = await dig(config);
-        } catch {
-          return;
-        }
+        const result = await dig(config);
 
         // Should visit at most 1 page.
         expect(result.artifacts.meta.pagesVisited).toBeLessThanOrEqual(1);
@@ -239,13 +226,7 @@ describe('Orchestrator internal behavior', () => {
 
       try {
         const config = makeConfig({ outputDir: tmpDir, maxPages: 1, depth: 0, noHar: true });
-        let result;
-        try {
-          result = await dig(config);
-        } catch {
-          return;
-        }
-
+        const result = await dig(config);
         expect(result.outputPaths.harFile).toBeUndefined();
       } finally {
         await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
@@ -258,14 +239,9 @@ describe('Orchestrator internal behavior', () => {
 
       try {
         const config = makeConfig({ outputDir: tmpDir, maxPages: 1, depth: 0, noHar: false });
-        let result;
-        try {
-          result = await dig(config);
-        } catch {
-          return;
-        }
+        const result = await dig(config);
 
-        // If the crawl errored (e.g. browser not installed), harFile may be undefined.
+        // If the crawl errored (e.g. target unreachable), harFile may be undefined.
         if (result.completionStatus === 'error') {
           expect(result.outputPaths.harFile).toBeUndefined();
         } else {
@@ -275,5 +251,176 @@ describe('Orchestrator internal behavior', () => {
         await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
       }
     });
+  });
+
+  // -----------------------------------------------------------------------
+  // Abort signal / graceful shutdown
+  //
+  // The orchestrator installs a SIGINT handler that aborts an internal
+  // AbortController. We can't reliably emit a real SIGINT cross-platform
+  // in tests (Windows), so we exercise the same logic by triggering the
+  // handler directly via `process.emit('SIGINT')` mid-crawl. This drives
+  // the exact path SIGINT would take.
+  // -----------------------------------------------------------------------
+
+  describe('abort signal', () => {
+    it('stops the crawl and returns a partial result when aborted mid-flight', async () => {
+      const { dig } = await import('../../src/crawl/orchestrator.js');
+      const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'pa-orch-abort-'));
+
+      try {
+        // Use a large depth + page budget so the crawl would otherwise run longer
+        // than our abort window. Aborting before the frontier is empty is what we
+        // want to verify.
+        const config = makeConfig({
+          outputDir: tmpDir,
+          maxPages: 100,
+          depth: 3,
+          targetUrl: 'https://example.com',
+          noHar: true,
+        });
+
+        // Fire a simulated SIGINT ~50ms after the crawl kicks off. This matches
+        // the orchestrator's registered SIGINT handler.
+        const abortTimer = setTimeout(() => {
+          process.emit('SIGINT');
+        }, 50);
+
+        try {
+          const result = await dig(config);
+
+          // The crawl should have been interrupted. Possible terminal statuses
+          // in this scenario:
+          //   - 'interrupted' if abort landed before the page finished
+          //   - 'complete'    if the single initial page finished before abort
+          //   - 'error'       if the remote was unreachable (still valid)
+          // We assert that if the crawl did continue, it did not exceed the
+          // budget — the key check is we got a DigResult back and partial
+          // artifacts were written.
+          expect(result).toBeDefined();
+          expect(result.artifacts).toBeDefined();
+
+          // crawl-summary.json must exist regardless of completion status.
+          const summaryPath = path.join(tmpDir, 'crawl-summary.json');
+          const summaryStat = await fs.stat(summaryPath).catch(() => null);
+          expect(summaryStat?.isFile()).toBe(true);
+        } finally {
+          clearTimeout(abortTimer);
+        }
+      } finally {
+        await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
+      }
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// buildRouteTree — hierarchical tree with shared prefixes
+// ---------------------------------------------------------------------------
+
+describe('buildRouteTree', () => {
+  /**
+   * Build a minimal PageVisitResult for a given URL. Only fields used by
+   * buildRouteTree are populated.
+   */
+  function pv(url: string, depth: number = 0): PageVisitResult {
+    return {
+      url,
+      finalUrl: url,
+      status: 'ok',
+      httpStatus: 200,
+      depth,
+      discoveryMethod: 'entry',
+      visitedAt: '2026-04-20T00:00:00Z',
+      durationMs: 10,
+      collectorErrors: [],
+      navigationEdges: [],
+      pageScan: {
+        url,
+        statusCode: 200,
+        title: `Title for ${url}`,
+        metaTags: [],
+        headings: [],
+        landmarks: [],
+        links: [],
+        interactiveElements: [],
+        timing: { loadTime: 0, domContentLoaded: 0 },
+        contentHash: 'hash',
+        hashRoutingDetected: false,
+      },
+    };
+  }
+
+  it('returns a root node for an empty page list', () => {
+    const tree = buildRouteTree([], 'https://example.com');
+    expect(tree.segment).toBe('/');
+    expect(tree.children).toEqual([]);
+  });
+
+  it('fills root node from the entry page', () => {
+    const tree = buildRouteTree([pv('https://example.com/')], 'https://example.com/');
+    expect(tree.statusCode).toBe(200);
+    expect(tree.title).toBe('Title for https://example.com/');
+  });
+
+  it('nests /a/b under /a — shared prefix, no flat siblings', () => {
+    const pages = [
+      pv('https://example.com/a', 1),
+      pv('https://example.com/a/b', 2),
+    ];
+    const tree = buildRouteTree(pages, 'https://example.com/');
+
+    expect(tree.children).toHaveLength(1);
+    const a = tree.children[0];
+    expect(a.segment).toBe('a');
+    expect(a.url).toBe('https://example.com/a');
+    expect(a.children).toHaveLength(1);
+    expect(a.children[0].segment).toBe('b');
+    expect(a.children[0].url).toBe('https://example.com/a/b');
+  });
+
+  it('creates intermediate directory nodes when parent page was not visited', () => {
+    const pages = [pv('https://example.com/a/b/c', 3)];
+    const tree = buildRouteTree(pages, 'https://example.com/');
+
+    expect(tree.children).toHaveLength(1);
+    const a = tree.children[0];
+    expect(a.segment).toBe('a');
+    // Intermediate nodes created on the path have no page, so no title.
+    expect(a.title).toBe('');
+    expect(a.url).toBe('');
+
+    const b = a.children[0];
+    expect(b.segment).toBe('b');
+
+    const c = b.children[0];
+    expect(c.segment).toBe('c');
+    expect(c.title).toBe('Title for https://example.com/a/b/c');
+  });
+
+  it('places top-level siblings as siblings under root', () => {
+    const pages = [
+      pv('https://example.com/a', 1),
+      pv('https://example.com/b', 1),
+    ];
+    const tree = buildRouteTree(pages, 'https://example.com/');
+
+    const segments = tree.children.map((c) => c.segment).sort();
+    expect(segments).toEqual(['a', 'b']);
+  });
+
+  it('does not duplicate intermediate nodes when multiple children share a prefix', () => {
+    const pages = [
+      pv('https://example.com/users/1', 2),
+      pv('https://example.com/users/2', 2),
+    ];
+    const tree = buildRouteTree(pages, 'https://example.com/');
+
+    expect(tree.children).toHaveLength(1);
+    const users = tree.children[0];
+    expect(users.segment).toBe('users');
+    expect(users.children).toHaveLength(2);
+    const ids = users.children.map((c) => c.segment).sort();
+    expect(ids).toEqual(['1', '2']);
   });
 });

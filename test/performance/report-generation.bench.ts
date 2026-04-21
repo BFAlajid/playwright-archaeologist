@@ -9,6 +9,11 @@
  * - Estimated output file size
  *
  * Run: npx vitest bench test/performance/report-generation.bench.ts
+ *
+ * TODO: this bench measures an inlined fake (manual template-string
+ * assembly and mock data generators) rather than the real report
+ * template. Replace with real imports from src/report/html/template.ts
+ * (generateReportHtml) before relying on budget enforcement.
  */
 
 import { bench, describe } from 'vitest';

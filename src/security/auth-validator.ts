@@ -11,6 +11,8 @@
 import { readFileSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 
+import { SecurityError } from '../types/errors.js';
+
 export interface AuthValidationResult {
   valid: boolean;
   warnings: string[];
@@ -142,17 +144,38 @@ export function validateAuthScript(scriptPath: string): AuthValidationResult {
  * Execute an authentication script by dynamically importing it and
  * calling its default export with the provided Playwright Page.
  *
+ * Before importing, the script is validated with `validateAuthScript()`.
+ * If static analysis produces any warnings (dangerous imports, eval, etc.),
+ * the script is rejected with a SecurityError unless `allowAuthScript`
+ * has been explicitly set. `yes` is *not* an override — unsafe auth
+ * scripts are a security gate, not a UX prompt.
+ *
  * @param scriptPath - Path to the auth script (.js, .mjs, or .ts via loader).
  * @param page - Playwright Page instance to pass to the auth function.
- * @param opts - Options. `yes: true` skips confirmation prompt.
+ * @param opts - Options. `allowAuthScript: true` bypasses the static-analysis gate.
+ * @throws SecurityError if static analysis finds dangerous patterns and
+ *         `allowAuthScript` is not set.
  * @throws If the script has no default export, the default export is not a function,
  *         or the auth function throws.
  */
 export async function executeAuthScript(
   scriptPath: string,
   page: any,
-  opts?: { yes?: boolean }
+  opts?: { yes?: boolean; allowAuthScript?: boolean }
 ): Promise<void> {
+  // Static analysis MUST run before the module is imported. If the import
+  // happens first, top-level side effects in a malicious script run before
+  // we can reject it.
+  const validation = validateAuthScript(scriptPath);
+  if (!validation.valid && !opts?.allowAuthScript) {
+    throw new SecurityError(
+      'auth_script_dangerous',
+      `Auth script '${scriptPath}' failed static analysis:\n  - ` +
+        validation.warnings.join('\n  - ') +
+        `\nRe-run with --allow-auth-script if you trust this script.`,
+    );
+  }
+
   // Convert to file URL for dynamic import
   const fileUrl = pathToFileURL(scriptPath).href;
 

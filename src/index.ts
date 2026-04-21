@@ -10,7 +10,7 @@ export { dig } from './crawl/orchestrator.js';
 
 // Configuration types
 export type { CrawlConfig, ResolvedConfig, Viewport, OutputFormat, DiffConfig } from './types/config.js';
-export { CrawlConfigSchema, DiffConfigSchema, ViewportSchema, parseViewport, normalizeEntryUrl } from './types/config.js';
+export { CrawlConfigSchema, DiffConfigSchema, ViewportSchema, parseViewport, normalizeEntryUrl, resolveConfig } from './types/config.js';
 
 // Artifact types
 export type {
@@ -53,15 +53,13 @@ export type { AuthOptions, AuthResult } from './auth/auth-handler.js';
 
 // Crawl utilities
 export { Frontier } from './crawl/frontier.js';
-export { ContextPool } from './crawl/context-pool.js';
-export { writeCheckpoint, readCheckpoint, deleteCheckpoint, createCheckpointState, setupAutoCheckpoint } from './crawl/checkpoint.js';
 
 // Assembler
 export { groupEndpoints } from './assembler/api-grouper.js';
 export { buildFlowGraph, generateMermaidDefinition, detectCycles } from './assembler/flow-graph.js';
 
 // Report
-export { generateReportHtml } from './report/html/template.js';
+export { generateReportHtml, generateMermaidSvgString } from './report/html/template.js';
 export { escapeHtml, escapeAttribute, escapeJsonInHtml } from './report/html/escape.js';
 
 // Progress
@@ -73,6 +71,14 @@ export { createBundle } from './bundle/bundle-creator.js';
 // Diff
 export { diffBundles } from './diff/diff-engine.js';
 export { generateDiffReportHtml } from './diff/diff-report.js';
+export { diffScreenshotPair } from './diff/screenshot-diff.js';
+export type { ScreenshotDiffOptions, ScreenshotDiffResult } from './diff/screenshot-diff.js';
 
 // OpenAPI
 export { generateOpenApiSpec, writeOpenApiSpec } from './report/openapi-output.js';
+
+// Collector plugins (programmatic API — see README section "Plugins")
+export { CollectorRegistry, DEFAULT_COLLECTOR_TIMEOUT_MS } from './plugins/registry.js';
+export type { Collector, CollectorContext, CollectorResult } from './plugins/types.js';
+export { AxeCollector } from './plugins/axe-collector.js';
+export type { AxeResult, AxeViolation } from './plugins/axe-collector.js';

@@ -24,7 +24,11 @@ import type {
   WebSocketConnection,
   RequestClassification,
 } from '../types/artifacts.js';
-import { scrubHeaders, scrubBody } from '../security/credential-scrubber.js';
+import {
+  scrubHeaders,
+  scrubBody,
+  scrubJsonObject,
+} from '../security/credential-scrubber.js';
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -79,6 +83,12 @@ const STATIC_RESOURCE_TYPES = new Set([
 
 export interface NetworkLoggerOptions {
   includeCookies?: boolean;
+  /**
+   * Capture JavaScript response bodies. Off by default — raw JS bundles
+   * frequently contain hardcoded API keys, tokens, and feature-flag
+   * secrets that the credential scrubber cannot reliably detect.
+   */
+  captureJsBodies?: boolean;
 }
 
 export interface NetworkLogger {
@@ -103,6 +113,7 @@ export function createNetworkLogger(
   options?: NetworkLoggerOptions,
 ): NetworkLogger {
   const includeCookies = options?.includeCookies ?? false;
+  const captureJsBodies = options?.captureJsBodies ?? false;
 
   // Internal state
   let counter = 0;
@@ -113,6 +124,18 @@ export function createNetworkLogger(
   const failedRequests: FailedRequest[] = [];
   const graphqlOperations: GraphQLOperation[] = [];
   const webSocketConnections: WebSocketConnection[] = [];
+  /**
+   * Per-request classification for O(1) lookup in the response handler.
+   * Used to gate the expensive `response.body()` IPC for static/analytics
+   * responses that we never want to capture body text for.
+   */
+  const requestClassifications = new Map<string, RequestClassification>();
+  /**
+   * Index of GraphQL operations keyed by their originating request id.
+   * Replaces the O(Gql × Req) scan that previously matched operations
+   * back to responses.
+   */
+  const gqlOpsByRequestId = new Map<string, GraphQLOperation>();
 
   // Parse the page origin for third-party classification
   let pageOrigin = '';
@@ -219,17 +242,26 @@ export function createNetworkLogger(
     try {
       const parsed = JSON.parse(body);
       const operationName = parsed.operationName ?? 'unknown';
-      const query: string = parsed.query ?? '';
-      const variables = parsed.variables;
+      const rawQuery: string = parsed.query ?? '';
+      const rawVariables = parsed.variables;
 
-      // Determine operation type from query string
+      // Determine operation type from the raw query string (scrubbing the
+      // query text below can replace mutation/subscription keywords that
+      // happen to appear inside argument values).
       let operationType: GraphQLOperation['operationType'] = 'query';
-      const trimmedQuery = query.trimStart();
+      const trimmedQuery = rawQuery.trimStart();
       if (trimmedQuery.startsWith('mutation')) {
         operationType = 'mutation';
       } else if (trimmedQuery.startsWith('subscription')) {
         operationType = 'subscription';
       }
+
+      // Scrub inline argument-style secrets embedded in the query text, e.g.
+      // `mutation { login(email: "x", password: "hunter2") { ... } }`.
+      const query = rawQuery.replace(
+        /\b(password|passwd|secret|client_secret|token|access_token|refresh_token|api_key|apikey|aws_access_key|aws_secret_key)\s*:\s*("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|[^,)\s]+)/gi,
+        '$1: "[REDACTED]"',
+      );
 
       const op: GraphQLOperation = {
         pageUrl,
@@ -239,11 +271,21 @@ export function createNetworkLogger(
         query,
       };
 
-      if (variables !== undefined && variables !== null) {
-        op.variables = variables;
+      if (rawVariables !== undefined && rawVariables !== null) {
+        // Variables frequently contain passwords, API keys, and session
+        // tokens. Route them through the same JSON scrubber we use on
+        // request/response bodies so sensitive fields are redacted before
+        // we store them in the network log.
+        op.variables =
+          typeof rawVariables === 'object'
+            ? scrubJsonObject(rawVariables)
+            : rawVariables;
       }
 
       graphqlOperations.push(op);
+      // Index by requestId so the response handler can find the matching
+      // operation in O(1) instead of scanning every op per response.
+      gqlOpsByRequestId.set(requestId, op);
     } catch {
       // Body is not valid JSON — skip GraphQL detection
     }
@@ -267,6 +309,9 @@ export function createNetworkLogger(
 
     const classification = classifyRequest(url, resourceType, contentType);
     const initiator = mapInitiator(resourceType);
+
+    // Record classification for O(1) lookup during response handling.
+    requestClassifications.set(id, classification);
 
     const captured: CapturedRequest = {
       requestId: id,
@@ -303,21 +348,43 @@ export function createNetworkLogger(
     const statusCode = response.status();
     const contentType = rawHeaders['content-type'] ?? undefined;
 
-    // Attempt to capture body for text-based responses
+    // Determine this response's classification by looking up the matching
+    // request. Classification was already computed when the request fired;
+    // we reuse it here to gate the expensive `response.body()` IPC round-trip.
+    const matchingReqClassification = requestClassifications.get(id);
+
+    // Attempt to capture body only when the classification warrants it.
+    // Skipping static/analytics/WebSocket/third-party asset bodies eliminates
+    // 30-70% of per-page IPC on asset-heavy pages. API responses are always
+    // captured; other text responses (HTML, XML, etc.) are captured unless
+    // classified as static/analytics.
     let body: string | undefined;
     let bodySize = 0;
 
-    try {
-      const buffer = await response.body();
-      bodySize = buffer.length;
+    const shouldCaptureBody =
+      matchingReqClassification === 'api' ||
+      (
+        contentType !== undefined &&
+        isTextContentType(contentType, captureJsBodies) &&
+        matchingReqClassification !== 'static' &&
+        matchingReqClassification !== 'analytics' &&
+        matchingReqClassification !== 'websocket'
+      );
 
-      // Only capture text-based content types
-      if (contentType && isTextContentType(contentType)) {
-        const text = buffer.toString('utf-8');
-        body = text.length > MAX_BODY_SIZE ? text.slice(0, MAX_BODY_SIZE) : text;
+    if (shouldCaptureBody) {
+      try {
+        const buffer = await response.body();
+        bodySize = buffer.length;
+
+        // API responses still need the content-type check for text decoding.
+        // Binary API responses (e.g., protobuf) fall through without a body.
+        if (contentType && isTextContentType(contentType, captureJsBodies)) {
+          const text = buffer.toString('utf-8');
+          body = text.length > MAX_BODY_SIZE ? text.slice(0, MAX_BODY_SIZE) : text;
+        }
+      } catch {
+        // Body may not be available (e.g. redirects, streaming)
       }
-    } catch {
-      // Body may not be available (e.g. redirects, streaming)
     }
 
     const captured: CapturedResponse = {
@@ -337,13 +404,11 @@ export function createNetworkLogger(
 
     responses.push(captured);
 
-    // Attach response data to GraphQL operations
+    // Attach response data to the matching GraphQL operation.
+    // O(1) lookup via requestId index — replaces the previous
+    // O(Gql × Req) nested scan.
     if (body) {
-      const gqlOp = graphqlOperations.find(op => {
-        // Match by the request that produced this response
-        const matchingReq = requests.find(r => r.requestId === id);
-        return matchingReq && op.endpointUrl === matchingReq.url;
-      });
+      const gqlOp = gqlOpsByRequestId.get(id);
       if (gqlOp && gqlOp.responseData === undefined) {
         try {
           gqlOp.responseData = JSON.parse(body);
@@ -456,14 +521,24 @@ export function createNetworkLogger(
 
 /**
  * Determine if a content-type is text-based and worth capturing the body.
+ *
+ * JavaScript bundles (`application/javascript`, `text/javascript`) are
+ * excluded by default. Raw JS bodies often contain hardcoded API keys
+ * that the credential scrubber cannot reliably detect. Set
+ * `captureJsBodies = true` to opt back in for debugging specific bundles.
  */
-function isTextContentType(contentType: string): boolean {
+function isTextContentType(contentType: string, captureJsBodies = false): boolean {
   const lower = contentType.toLowerCase();
+
+  const isJs =
+    lower.includes('application/javascript') ||
+    lower.includes('text/javascript');
+  if (isJs) return captureJsBodies;
+
   return (
     lower.includes('text/') ||
     lower.includes('application/json') ||
     lower.includes('application/xml') ||
-    lower.includes('application/javascript') ||
     lower.includes('application/xhtml') ||
     lower.includes('application/graphql') ||
     lower.includes('+json') ||

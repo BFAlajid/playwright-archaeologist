@@ -396,6 +396,187 @@ describe('ContextPool', () => {
   });
 
   // -----------------------------------------------------------------------
+  // setupContext hook
+  // -----------------------------------------------------------------------
+
+  describe('setupContext hook', () => {
+    it('calls setupContext exactly once per newly-created context', async () => {
+      const setup = vi.fn().mockResolvedValue(undefined);
+      const pool = new ContextPool(browser, defaultOptions({ concurrency: 2, setupContext: setup }));
+
+      const ctx1 = await pool.acquire();
+      const ctx2 = await pool.acquire();
+      await pool.release(ctx1);
+
+      // Re-acquire ctx1 — it should not re-run setup because context was reused.
+      const ctx1Reused = await pool.acquire();
+      expect(ctx1Reused).toBe(ctx1);
+
+      expect(setup).toHaveBeenCalledTimes(2);
+    });
+
+    it('runs setupContext before acquire returns', async () => {
+      let setupDone = false;
+      const pool = new ContextPool(
+        browser,
+        defaultOptions({
+          setupContext: async () => {
+            await Promise.resolve();
+            setupDone = true;
+          },
+        }),
+      );
+
+      const ctx = await pool.acquire();
+      expect(ctx).toBeDefined();
+      expect(setupDone).toBe(true);
+    });
+
+    it('closes the context if setupContext throws', async () => {
+      const ctx = createMockContext('c1');
+      const browserWithOne = createMockBrowser([ctx]);
+      const pool = new ContextPool(
+        browserWithOne,
+        defaultOptions({
+          setupContext: async () => {
+            throw new Error('setup failed');
+          },
+        }),
+      );
+      await expect(pool.acquire()).rejects.toThrow('setup failed');
+      expect(ctx.close).toHaveBeenCalled();
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // drain
+  // -----------------------------------------------------------------------
+
+  describe('drain', () => {
+    it('closes every context the pool has ever created', async () => {
+      const pool = new ContextPool(browser, defaultOptions({ concurrency: 2 }));
+
+      const ctx1 = await pool.acquire();
+      const ctx2 = await pool.acquire();
+      await pool.release(ctx1);
+
+      await pool.drain();
+
+      expect(ctx1.close).toHaveBeenCalled();
+      expect(ctx2.close).toHaveBeenCalled();
+    });
+
+    it('marks the pool closed (acquire rejects)', async () => {
+      const pool = new ContextPool(browser, defaultOptions());
+      await pool.drain();
+      await expect(pool.acquire()).rejects.toThrow('closed');
+    });
+
+    it('exposes createdContexts in creation order', async () => {
+      const pool = new ContextPool(browser, defaultOptions({ concurrency: 3 }));
+      const a = await pool.acquire();
+      const b = await pool.acquire();
+      const c = await pool.acquire();
+      expect(pool.createdContexts).toEqual([a, b, c]);
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // Stress / concurrency under load
+  // -----------------------------------------------------------------------
+
+  describe('stress', () => {
+    it('50 concurrent acquires at size=2 all resolve and none starves', async () => {
+      let newContextCalls = 0;
+      const stressBrowser = {
+        newContext: vi.fn().mockImplementation(async () => {
+          newContextCalls++;
+          // Tiny async gap so acquire() has to interleave with release().
+          await Promise.resolve();
+          return createMockContext(`stress-${newContextCalls}`);
+        }),
+      } as unknown as Browser;
+
+      const pool = new ContextPool(
+        stressBrowser,
+        defaultOptions({ concurrency: 2, recycleAfter: 1000 }),
+      );
+
+      // 50 "workers" each acquire, do a trivial await, then release. The
+      // critical assertion is liveness: every worker completes, none starves,
+      // and the pool drains to idle. Starvation here would manifest as a
+      // timeout (Vitest's default 30s).
+      const results = await Promise.all(
+        Array.from({ length: 50 }, async (_, i) => {
+          const ctx = await pool.acquire();
+          const observedActive = pool.activeCount;
+          // Yield so interleaving is actually tested.
+          await Promise.resolve();
+          await pool.release(ctx);
+          return { i, observedActive };
+        }),
+      );
+
+      expect(results).toHaveLength(50);
+
+      // Concurrency cap is enforced by `pendingCreations` incrementing
+      // synchronously before the gate-passing acquire awaits newContext().
+      // Every observed in-flight count must respect the configured limit.
+      for (const { observedActive } of results) {
+        expect(observedActive).toBeGreaterThan(0);
+        expect(observedActive).toBeLessThanOrEqual(2);
+      }
+
+      // Final state: no contexts acquired, at least one idle.
+      expect(pool.activeCount).toBe(0);
+      expect(pool.availableCount).toBeGreaterThanOrEqual(1);
+      // With the semaphore fixed, only `concurrency` contexts should ever
+      // have been created — all 50 workers reuse them via the idle pool.
+      expect(newContextCalls).toBeGreaterThan(0);
+      expect(newContextCalls).toBeLessThanOrEqual(2);
+    });
+
+    it('release during close does not hang', async () => {
+      const pool = new ContextPool(browser, defaultOptions({ concurrency: 2 }));
+
+      const ctx1 = await pool.acquire();
+      const ctx2 = await pool.acquire();
+
+      // Kick off closeAll(); immediately after, call release on the
+      // contexts that are still "owned" by the caller. Even though
+      // closeAll() already closed them, release() must not throw or
+      // hang — the pool has a defined shutdown contract.
+      const closePromise = pool.closeAll();
+
+      // Concurrent releases — they may either succeed (no-op because
+      // the pool now owns the context lifecycle) or throw a clear
+      // "not owned" error. They MUST NOT hang. Race them against a
+      // short timeout to prove liveness.
+      const releaseWithTimeout = async (ctx: BrowserContext): Promise<void> => {
+        await Promise.race([
+          pool
+            .release(ctx)
+            .catch(() => {
+              /* a "not owned" error is acceptable post-close */
+            }),
+          new Promise<void>((_, reject) =>
+            setTimeout(() => reject(new Error('release hung')), 500),
+          ),
+        ]);
+      };
+
+      await Promise.all([
+        releaseWithTimeout(ctx1),
+        releaseWithTimeout(ctx2),
+      ]);
+      await closePromise;
+
+      // The pool is closed; acquire() must reject cleanly.
+      await expect(pool.acquire()).rejects.toThrow(/closed/);
+    });
+  });
+
+  // -----------------------------------------------------------------------
   // Input validation
   // -----------------------------------------------------------------------
 

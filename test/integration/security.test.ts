@@ -1,29 +1,35 @@
 /**
- * Integration tests for security features.
+ * Integration tests for security features, exercising REAL src/ modules.
  *
- * Tests security hardening:
- * - SSRF to localhost blocked
- * - SSRF to 169.254.169.254 blocked
- * - file:// URL blocked
- * - javascript: URL blocked
- * - Credentials scrubbed from output
- * - HTML report XSS prevention
- * - Dialog dismissal (alert doesn't hang)
- * - Popup blocking
- * - Download blocking
+ * Earlier revisions reimplemented route-interception and SSRF checks
+ * inline. That tested Playwright, not our code. This rewrite drives
+ * the production SSRF guard (createNetworkGuard / isBlockedUrl) and
+ * browser hardening helpers from `src/security`, so regressions in
+ * those modules trigger test failures.
  */
 
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
-import { chromium, type Browser, type BrowserContext, type Page } from 'playwright';
-import { startTestApp, type TestAppHandle } from '../fixtures/test-app/setup.js';
+import { chromium, type Browser } from 'playwright';
 
-describe('Security', () => {
+import {
+  isBlockedUrl,
+  createNetworkGuard,
+  isPrivateIp,
+} from '../../src/security/network-guard.js';
+import {
+  getSecureContextOptions,
+  getSecureLaunchOptions,
+} from '../../src/security/browser-hardening.js';
+import { startTestApp, type TestAppHandle } from '../fixtures/test-app/setup.js';
+import { hasChromium } from '../helpers/has-chromium.js';
+
+describe.skipIf(!hasChromium)('Security (real src modules)', () => {
   let app: TestAppHandle;
   let browser: Browser;
 
   beforeAll(async () => {
     app = await startTestApp();
-    browser = await chromium.launch();
+    browser = await chromium.launch(getSecureLaunchOptions());
   });
 
   afterAll(async () => {
@@ -32,94 +38,89 @@ describe('Security', () => {
   });
 
   // -----------------------------------------------------------------------
-  // SSRF protection
+  // SSRF guard — exercises src/security/network-guard.ts directly.
   // -----------------------------------------------------------------------
 
-  describe('SSRF protection', () => {
-    it('can block requests to localhost via route interception', async () => {
-      const context = await browser.newContext();
-      const page = await context.newPage();
-
-      const blockedUrls: string[] = [];
-
-      // Set up route interception to block private IPs
-      await page.route('**/*', async (route) => {
-        const url = route.request().url();
-        try {
-          const hostname = new URL(url).hostname;
-          if (
-            hostname === 'localhost' ||
-            hostname === '127.0.0.1' ||
-            hostname.startsWith('10.') ||
-            hostname.startsWith('192.168.') ||
-            hostname === '169.254.169.254'
-          ) {
-            // For testing, allow same-origin (our test server)
-            if (url.startsWith(app.url)) {
-              await route.continue();
-              return;
-            }
-            blockedUrls.push(url);
-            await route.abort('blockedbyclient');
-            return;
-          }
-        } catch {
-          // URL parsing failed
-        }
-        await route.continue();
-      });
-
-      try {
-        await page.goto(app.url, { waitUntil: 'domcontentloaded' });
-
-        // Attempt to fetch a private IP from within the page
-        const result = await page.evaluate(async () => {
-          try {
-            await fetch('http://169.254.169.254/latest/meta-data/');
-            return 'success';
-          } catch {
-            return 'blocked';
-          }
-        });
-
-        expect(result).toBe('blocked');
-      } finally {
-        await context.close();
-      }
+  describe('network-guard isBlockedUrl', () => {
+    it('blocks AWS IMDS (169.254.169.254) unless allowPrivate', async () => {
+      const blocked = await isBlockedUrl('http://169.254.169.254/latest/meta-data/');
+      expect(blocked.blocked).toBe(true);
+      expect(blocked.reason).toMatch(/metadata|private/i);
     });
 
-    it('blocks file:// protocol navigation', async () => {
-      const context = await browser.newContext();
-      const page = await context.newPage();
+    it('blocks 127.0.0.1 unless allowPrivate', async () => {
+      const blocked = await isBlockedUrl('http://127.0.0.1:3000/');
+      expect(blocked.blocked).toBe(true);
+    });
 
-      try {
-        // Attempting to navigate to file:// should fail
-        await expect(
-          page.goto('file:///etc/passwd', { timeout: 3000 })
-        ).rejects.toThrow();
-      } finally {
-        await context.close();
-      }
+    it('blocks file:// protocol', async () => {
+      const blocked = await isBlockedUrl('file:///etc/passwd');
+      expect(blocked.blocked).toBe(true);
+      expect(blocked.reason).toMatch(/protocol/i);
     });
 
     it('blocks javascript: protocol', async () => {
-      const context = await browser.newContext();
+      const blocked = await isBlockedUrl('javascript:alert(1)');
+      expect(blocked.blocked).toBe(true);
+    });
+
+    it('allows the fixture URL when allowPrivate is set', async () => {
+      const blocked = await isBlockedUrl(app.url, { allowPrivate: true });
+      expect(blocked.blocked).toBe(false);
+    });
+
+    it('isPrivateIp flags RFC1918 ranges', () => {
+      expect(isPrivateIp('10.0.0.5')).toBe(true);
+      expect(isPrivateIp('192.168.1.1')).toBe(true);
+      expect(isPrivateIp('172.16.0.1')).toBe(true);
+      expect(isPrivateIp('127.0.0.1')).toBe(true);
+      expect(isPrivateIp('8.8.8.8')).toBe(false);
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // End-to-end SSRF: createNetworkGuard installed on a real Playwright
+  // context must abort a request to a private IP.
+  // -----------------------------------------------------------------------
+
+  describe('createNetworkGuard end-to-end', () => {
+    it('aborts requests to private IPs from within a Playwright page', async () => {
+      const context = await browser.newContext(
+        getSecureContextOptions({ viewport: { width: 1024, height: 768 } }),
+      );
       const page = await context.newPage();
+      page.on('dialog', (d) => d.dismiss());
+
+      // Install the real guard (allowPrivate NOT set) — it should block
+      // any same-frame request to 127.0.0.1 / AWS metadata, etc.
+      await context.route('**/*', createNetworkGuard());
 
       try {
-        await page.goto(app.url, { waitUntil: 'domcontentloaded' });
+        // Navigate to the fixture first (allowed via same-origin — the
+        // guard blocks all private IPs including fixture, so we need
+        // allowPrivate for THE FIXTURE. So we need a guard with allowPrivate
+        // for the entry URL but still exercise the block for another private
+        // target. Split approach: navigate to real https site via a
+        // data: URL substitute, then fetch a private IP and observe block.
+        //
+        // Simplest: load about:blank and fetch 169.254.169.254.
+        await page.goto('about:blank');
 
-        // javascript: URLs should not execute via navigation
-        const result = await page.evaluate(() => {
-          const link = document.createElement('a');
-          link.href = 'javascript:void(document.title="hacked")';
-          // The href is set, but following it should be blocked
-          return link.href;
+        const fetchResult = await page.evaluate(async () => {
+          try {
+            const res = await fetch('http://169.254.169.254/latest/meta-data/', {
+              mode: 'no-cors',
+            });
+            return { ok: true, status: res.status };
+          } catch (err) {
+            return { ok: false, err: String(err) };
+          }
         });
 
-        // The page title should not have been changed
-        const title = await page.title();
-        expect(title).not.toBe('hacked');
+        // The fetch must have been aborted by the guard. Either the
+        // browser sees it as a network error (ok: false) or the route
+        // handler short-circuited with blockedbyclient.
+        expect(fetchResult.ok).toBe(false);
       } finally {
         await context.close();
       }
@@ -127,250 +128,89 @@ describe('Security', () => {
   });
 
   // -----------------------------------------------------------------------
-  // Credential scrubbing in intercepted data
+  // Secure browser hardening flags come through as expected.
   // -----------------------------------------------------------------------
 
-  describe('credential scrubbing', () => {
-    it('captures API calls containing auth headers', async () => {
-      const context = await browser.newContext();
+  describe('browser hardening defaults', () => {
+    it('launch options disable SIGINT handling so the tool controls shutdown', () => {
+      const opts = getSecureLaunchOptions();
+      expect(opts.handleSIGINT).toBe(false);
+      expect(opts.handleSIGTERM).toBe(false);
+      expect(opts.handleSIGHUP).toBe(false);
+    });
+
+    it('context options bypass CSP and block downloads', () => {
+      const opts = getSecureContextOptions({
+        viewport: { width: 1280, height: 720 },
+      });
+      expect(opts.bypassCSP).toBe(true);
+      expect(opts.acceptDownloads).toBe(false);
+      expect(opts.viewport).toEqual({ width: 1280, height: 720 });
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // Popup, dialog, and download handling — confirms the hardening
+  // options produce the documented behavior against a real page.
+  // -----------------------------------------------------------------------
+
+  describe('runtime hardening behavior', () => {
+    it('dismisses dialogs without hanging the page', async () => {
+      const context = await browser.newContext(getSecureContextOptions({}));
+      const page = await context.newPage();
+      const seen: string[] = [];
+      page.on('dialog', (d) => {
+        seen.push(d.message());
+        d.dismiss().catch(() => {});
+      });
+
+      try {
+        // Fixture route that triggers a synchronous `alert()` on load.
+        await page.goto(`${app.url}/special/dialog`, {
+          waitUntil: 'load',
+          timeout: 5000,
+        });
+        // Page must still be responsive: we can query the title.
+        const title = await page.title();
+        expect(title.length).toBeGreaterThan(0);
+        // The dialog handler must have seen at least one dialog.
+        expect(seen.length).toBeGreaterThan(0);
+      } finally {
+        await context.close();
+      }
+    });
+
+    it('auto-closes popups opened by window.open (does not abort main page)', async () => {
+      const context = await browser.newContext(getSecureContextOptions({}));
       const page = await context.newPage();
 
-      const capturedHeaders: Record<string, string>[] = [];
-
-      page.on('request', (req) => {
-        if (req.url().includes('/api/')) {
-          capturedHeaders.push(req.headers());
+      // Register the popup close handler AFTER creating the main page so
+      // the handler does not fire for the initial page. This matches how
+      // the orchestrator installs handlers — on a per-context basis once
+      // the main inspection page is set up.
+      context.on('page', (p) => {
+        // Only close pages opened via window.open (popups have openers).
+        if (p.opener() !== null) {
+          p.close().catch(() => {});
         }
       });
 
       try {
         await page.goto(app.url, { waitUntil: 'domcontentloaded' });
 
-        // Make an API call with Authorization header
-        await page.evaluate(async (baseUrl) => {
-          await fetch(`${baseUrl}/api/users`, {
-            headers: {
-              Authorization: 'Bearer my-secret-token',
-            },
-          });
-        }, app.url);
-
-        // The raw captured headers contain the auth token
-        const apiCall = capturedHeaders.find((h) => h.authorization);
-        expect(apiCall).toBeDefined();
-
-        // When processed by the credential scrubber, it should be removed
-        // This test verifies the raw data IS captured (so the scrubber can work)
-        expect(apiCall!.authorization).toContain('Bearer');
-      } finally {
-        await context.close();
-      }
-    });
-  });
-
-  // -----------------------------------------------------------------------
-  // HTML report XSS prevention
-  // -----------------------------------------------------------------------
-
-  describe('XSS prevention', () => {
-    it('pages with XSS content do not execute scripts via capture', async () => {
-      const context = await browser.newContext();
-      const page = await context.newPage();
-
-      try {
-        await page.goto(app.url, { waitUntil: 'domcontentloaded' });
-
-        // Simulate capturing page content that contains XSS
-        const pageTitle = await page.title();
-        const content = await page.content();
-
-        // The raw content should not be directly embedded in HTML reports
-        // Any embedding must use escapeHtml
-        // This test documents that we can extract content safely
-        expect(pageTitle).toBeTruthy();
-        expect(content).toContain('<!DOCTYPE html>');
-      } finally {
-        await context.close();
-      }
-    });
-
-    it('captures pages with script tags without executing them in report context', async () => {
-      const context = await browser.newContext();
-      const page = await context.newPage();
-
-      try {
-        // Visit the dialog page which has an alert script
-        page.on('dialog', (d) => d.dismiss());
-        await page.goto(`${app.url}/dialog`, {
-          waitUntil: 'domcontentloaded',
-        });
-
-        // Extract the page content for reporting
-        const content = await page.content();
-        expect(content).toContain('<script>');
-
-        // When this content is used in a report, escapeHtml must be applied
-        // This test verifies we CAN capture script-containing pages
-      } finally {
-        await context.close();
-      }
-    });
-  });
-
-  // -----------------------------------------------------------------------
-  // Dialog dismissal
-  // -----------------------------------------------------------------------
-
-  describe('dialog handling', () => {
-    it('dismisses alert() without hanging', async () => {
-      const context = await browser.newContext();
-      const page = await context.newPage();
-
-      const dialogs: string[] = [];
-      page.on('dialog', async (dialog) => {
-        dialogs.push(dialog.message());
-        await dialog.dismiss();
-      });
-
-      try {
-        // Navigate to page with alert
-        await page.goto(`${app.url}/dialog`, {
-          waitUntil: 'domcontentloaded',
-          timeout: 5000,
-        });
-
-        // Dialog should have been caught and dismissed
-        expect(dialogs.length).toBeGreaterThan(0);
-
-        // Page should still be usable
-        const title = await page.title();
-        expect(title).toBeTruthy();
-      } finally {
-        await context.close();
-      }
-    });
-
-    it('handles confirm() dialogs by dismissing', async () => {
-      const context = await browser.newContext();
-      const page = await context.newPage();
-
-      page.on('dialog', (d) => d.dismiss());
-
-      try {
-        await page.goto(app.url, { waitUntil: 'domcontentloaded' });
-
-        // Trigger a confirm dialog
-        const result = await page.evaluate(() => {
-          return window.confirm('Are you sure?');
-        });
-
-        // dismiss() returns false for confirm dialogs
-        expect(result).toBe(false);
-      } finally {
-        await context.close();
-      }
-    });
-
-    it('handles prompt() dialogs by dismissing', async () => {
-      const context = await browser.newContext();
-      const page = await context.newPage();
-
-      page.on('dialog', (d) => d.dismiss());
-
-      try {
-        await page.goto(app.url, { waitUntil: 'domcontentloaded' });
-
-        const result = await page.evaluate(() => {
-          return window.prompt('Enter value:');
-        });
-
-        // dismiss() returns null for prompt dialogs
-        expect(result).toBeNull();
-      } finally {
-        await context.close();
-      }
-    });
-  });
-
-  // -----------------------------------------------------------------------
-  // Popup blocking
-  // -----------------------------------------------------------------------
-
-  describe('popup blocking', () => {
-    it('closes popups automatically', async () => {
-      const context = await browser.newContext();
-
-      const popupPages: Page[] = [];
-      context.on('page', (page) => {
-        popupPages.push(page);
-        page.close();
-      });
-
-      const page = await context.newPage();
-
-      try {
-        await page.goto(app.url, { waitUntil: 'domcontentloaded' });
-
-        // Attempt to open a popup
+        const beforeCount = context.pages().length;
         await page.evaluate(() => {
           window.open('https://example.com', '_blank');
         });
+        // Give the close handler a tick to fire.
+        await page.waitForTimeout(300);
 
-        await page.waitForTimeout(500);
-
-        // Any popup should have been caught by the context event
-        // and closed
-      } finally {
-        await context.close();
-      }
-    });
-  });
-
-  // -----------------------------------------------------------------------
-  // Download blocking
-  // -----------------------------------------------------------------------
-
-  describe('download blocking', () => {
-    it('blocks downloads when acceptDownloads is false', async () => {
-      const context = await browser.newContext({
-        acceptDownloads: false,
-      });
-      const page = await context.newPage();
-
-      try {
-        await page.goto(app.url, { waitUntil: 'domcontentloaded' });
-
-        // The context was created with acceptDownloads: false
-        // This prevents the crawler from being tricked into downloading
-        // large files. Playwright will not create download objects.
-        // This test documents the configuration.
-      } finally {
-        await context.close();
-      }
-    });
-  });
-
-  // -----------------------------------------------------------------------
-  // CSP bypass
-  // -----------------------------------------------------------------------
-
-  describe('CSP bypass', () => {
-    it('can run init scripts with bypassCSP enabled', async () => {
-      const context = await browser.newContext({ bypassCSP: true });
-      const page = await context.newPage();
-
-      try {
-        // addInitScript should work even on pages with strict CSP
-        await context.addInitScript(() => {
-          (window as any).__pa_injected = true;
-        });
-
-        await page.goto(app.url, { waitUntil: 'domcontentloaded' });
-
-        const injected = await page.evaluate(
-          () => (window as any).__pa_injected
-        );
-        expect(injected).toBe(true);
+        // The main page is still open; any popup has been closed.
+        expect(page.isClosed()).toBe(false);
+        const openPages = context.pages().filter((p) => !p.isClosed());
+        // Popup was either never created (blocked) or closed — either way,
+        // we should not have strictly more pages than before.
+        expect(openPages.length).toBeLessThanOrEqual(beforeCount);
       } finally {
         await context.close();
       }
