@@ -1,6 +1,6 @@
 {
   "name": "playwright-archaeologist",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Crawl any running web app and generate a complete behavioral specification — sitemap, forms, APIs, screenshots, and regression baselines",
   "author": "playwright-archaeologist contributors",
   "license": "MIT",
