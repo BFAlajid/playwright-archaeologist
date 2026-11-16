@@ -135,11 +135,11 @@ describe('fatal-handler', () => {
     });
 
     it('does not throw even when output dir cannot be created', async () => {
-      // Point at a path that cannot be created (on Windows a drive letter
-      // that doesn't exist causes mkdir to fail).
-      const badPath = process.platform === 'win32'
-        ? 'Z:\\definitely-not-a-real-path-123'
-        : '/proc/1/fake-nope';
+      // A path beneath a regular file fails with ENOTDIR on every platform.
+      // (A /proc path made Node's recursive mkdir spin forever on Linux.)
+      const blocker = path.join(tmpDir, 'blocker');
+      await fs.writeFile(blocker, 'x');
+      const badPath = path.join(blocker, 'sub');
       const config = mkConfig({ outputDir: badPath });
       const result = await handleFatalCrawlFailure({
         error: new Error('crash'),
